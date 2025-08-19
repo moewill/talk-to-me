@@ -1,0 +1,4 @@
+websockets
+whisper
+asyncio
+pytest
