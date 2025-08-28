@@ -89,7 +89,13 @@ class AudioProcessor:
         """
         self.model_name = model_name
         self.language = language
-        self.device = device
+        # Resolve "auto" device to specific device to avoid torch storage issues
+        if device == "auto":
+            import torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.debug(f"Resolved auto device to: {self.device}")
+        else:
+            self.device = device
         self.model = None
         self.model_loaded = False
         
@@ -138,28 +144,45 @@ class AudioProcessor:
         try:
             # Load model directly (bypass thread executor to avoid pickle issues)
             import whisper
+            import torch
+            
+            # Enhanced debugging information
+            logger.debug(f"Starting Whisper model loading - Model: {self.model_name}, Device: {self.device}")
+            logger.debug(f"PyTorch version: {torch.__version__}")
+            logger.debug(f"Whisper version: {getattr(whisper, '__version__', 'unknown')}")
+            logger.debug(f"CUDA available: {torch.cuda.is_available()}")
+            logger.debug(f"Cache directory: {os.path.expanduser('~/.cache/whisper')}")
             
             # Patch torch.load temporarily for model loading
-            import torch
             original_load = torch.load
             
             def whisper_compatible_load(*args, **kwargs):
+                logger.debug(f"torch.load called with args: {len(args)} kwargs: {list(kwargs.keys())}")
                 kwargs['weights_only'] = False
+                logger.debug("Applied weights_only=False patch")
                 return original_load(*args, **kwargs)
             
             torch.load = whisper_compatible_load
+            logger.debug("Applied torch.load patch")
             
             try:
+                logger.debug("Calling whisper.load_model()...")
                 self.model = whisper.load_model(self.model_name, device=self.device)
                 self.model_loaded = True
                 logger.info(f"Whisper model '{self.model_name}' loaded successfully")
+                logger.debug(f"Model type: {type(self.model)}")
                 return True
             finally:
                 # Restore original torch.load
                 torch.load = original_load
+                logger.debug("Restored original torch.load")
             
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            logger.error(f"Exception args: {e.args}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
 
     def _load_model_sync(self):
@@ -334,7 +357,31 @@ class AudioProcessor:
             Tuple of (numpy_array, duration_in_seconds)
         """
         try:
-            # Create temporary file for audio processing
+            # Handle raw PCM data directly (from browser WebAudio)
+            if audio_format == "raw_pcm":
+                # Convert raw PCM bytes to numpy array (assume 16-bit signed integers)
+                audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                duration = len(audio_array) / self.sample_rate
+                self._last_sample_rate = self.sample_rate
+                
+                # Enhanced debugging for audio characteristics
+                logger.debug(f"Raw PCM audio debug:")
+                logger.debug(f"  - Bytes received: {len(audio_bytes)}")
+                logger.debug(f"  - Samples count: {len(audio_array)}")
+                logger.debug(f"  - Duration: {duration:.3f}s")
+                logger.debug(f"  - Sample rate assumed: {self.sample_rate} Hz")
+                logger.debug(f"  - Audio RMS level: {np.sqrt(np.mean(audio_array**2)):.6f}")
+                logger.debug(f"  - Audio peak level: {np.max(np.abs(audio_array)):.6f}")
+                logger.debug(f"  - Non-zero samples: {np.count_nonzero(audio_array)}/{len(audio_array)}")
+                
+                # Check if audio is essentially silent
+                rms_level = np.sqrt(np.mean(audio_array**2))
+                if rms_level < 0.001:
+                    logger.warning(f"Audio appears to be silent (RMS: {rms_level:.6f})")
+                
+                return audio_array, duration
+            
+            # Create temporary file for other audio formats
             with tempfile.NamedTemporaryFile(suffix=f".{audio_format}", delete=False) as temp_file:
                 temp_file.write(audio_bytes)
                 temp_file_path = temp_file.name

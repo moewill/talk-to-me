@@ -36,6 +36,9 @@ class ConnectionInfo:
     connected_at: float
     last_activity: float
     processed_messages: int
+    audio_buffer: bytes
+    last_audio_time: float
+    buffer_start_time: Optional[float]
 
 
 @dataclass
@@ -102,6 +105,11 @@ class VoiceGateway:
         self.max_message_size = 10 * 1024 * 1024  # 10MB
         self.heartbeat_interval = 30  # seconds
         
+        # Audio buffering configuration
+        self.audio_buffer_duration = 2.0  # seconds - buffer audio for 2 seconds before processing
+        self.audio_silence_timeout = 0.5  # seconds - process buffer if no audio for 500ms
+        self.min_buffer_duration = 0.5   # seconds - minimum audio length to process
+        
         # Server state
         self.server = None
         self.running = False
@@ -141,6 +149,7 @@ class VoiceGateway:
             # Start background tasks
             asyncio.create_task(self._heartbeat_task())
             asyncio.create_task(self._stats_logger_task())
+            asyncio.create_task(self._audio_buffer_processor_task())
             
         except Exception as e:
             logger.error(f"Failed to start Voice Gateway server: {e}")
@@ -185,7 +194,10 @@ class VoiceGateway:
             connection_id=connection_id,
             connected_at=time.time(),
             last_activity=time.time(),
-            processed_messages=0
+            processed_messages=0,
+            audio_buffer=b"",
+            last_audio_time=0.0,
+            buffer_start_time=None
         )
         
         self.active_connections[connection_id] = connection_info
@@ -314,26 +326,81 @@ class VoiceGateway:
 
     async def _handle_audio_message(self, connection_info: ConnectionInfo, audio_data: bytes) -> None:
         """
-        Handle binary audio data.
+        Handle binary audio data with buffering.
         
         Args:
             connection_info: Connection information
             audio_data: Raw audio data
         """
-        start_time = time.time()
-        websocket = connection_info.websocket
+        current_time = time.time()
+        connection_info.last_audio_time = current_time
         
         try:
+            # Initialize buffer timing if first audio chunk
+            if connection_info.buffer_start_time is None:
+                connection_info.buffer_start_time = current_time
+                logger.debug(f"[{connection_info.connection_id}] Started audio buffering")
+            
+            # Add audio data to buffer
+            connection_info.audio_buffer += audio_data
+            buffer_duration = len(connection_info.audio_buffer) / (16000 * 2)  # 16kHz, 16-bit
+            
+            logger.debug(f"[{connection_info.connection_id}] Buffered audio: {len(audio_data)} bytes, "
+                        f"total buffer: {len(connection_info.audio_buffer)} bytes ({buffer_duration:.2f}s)")
+            
+            # Check if we should process the buffer
+            should_process = False
+            reason = ""
+            
+            # Process if buffer has enough audio (2+ seconds)
+            if buffer_duration >= self.audio_buffer_duration:
+                should_process = True
+                reason = f"buffer full ({buffer_duration:.2f}s)"
+            
+            if should_process:
+                await self._process_buffered_audio(connection_info, reason)
+                
+        except Exception as e:
+            logger.error(f"Error handling audio from {connection_info.connection_id}: {e}")
+            await self._send_error(connection_info.websocket, f"Audio handling error: {str(e)}")
+    
+    async def _process_buffered_audio(self, connection_info: ConnectionInfo, reason: str) -> None:
+        """
+        Process accumulated audio buffer.
+        
+        Args:
+            connection_info: Connection information
+            reason: Reason for processing (for debugging)
+        """
+        if not connection_info.audio_buffer:
+            return
+            
+        start_time = time.time()
+        websocket = connection_info.websocket
+        buffer_size = len(connection_info.audio_buffer)
+        buffer_duration = buffer_size / (16000 * 2)  # 16kHz, 16-bit
+        
+        try:
+            logger.debug(f"[{connection_info.connection_id}] Processing buffered audio: {reason}")
+            
             # Send processing acknowledgment
             await self._send_message(websocket, {
                 "type": "processing",
                 "status": "transcribing",
-                "audio_size": len(audio_data)
+                "audio_size": buffer_size,
+                "buffer_duration": buffer_duration
             })
             
-            # Transcribe audio
-            transcription_result = await self.audio_processor.transcribe(audio_data)
+            # Transcribe buffered audio
+            transcription_result = await self.audio_processor.transcribe(
+                connection_info.audio_buffer, 
+                audio_format="raw_pcm"
+            )
             self.stats.total_audio_processed += 1
+            
+            # Clear the buffer after processing
+            connection_info.audio_buffer = b""
+            connection_info.buffer_start_time = None
             
             if not transcription_result.success:
                 await self._send_error(websocket, f"Transcription failed: {transcription_result.error}")
@@ -345,7 +412,8 @@ class VoiceGateway:
                 "text": transcription_result.text,
                 "confidence": transcription_result.confidence,
                 "language": transcription_result.language,
-                "processing_time": transcription_result.processing_time
+                "processing_time": transcription_result.processing_time,
+                "buffer_duration": buffer_duration
             })
             
             # Process the transcribed text
@@ -357,8 +425,11 @@ class VoiceGateway:
             self._update_processing_time(processing_time)
             
         except Exception as e:
-            logger.error(f"Error processing audio from {connection_info.connection_id}: {e}")
+            logger.error(f"Error processing buffered audio from {connection_info.connection_id}: {e}")
             await self._send_error(websocket, f"Audio processing error: {str(e)}")
+            # Clear buffer on error to prevent stuck state
+            connection_info.audio_buffer = b""
+            connection_info.buffer_start_time = None
 
     async def _process_text_command(self, connection_info: ConnectionInfo, text: str) -> None:
         """
@@ -528,6 +599,41 @@ class VoiceGateway:
                 break
             except Exception as e:
                 logger.error(f"Error in stats logger task: {e}")
+    
+    async def _audio_buffer_processor_task(self) -> None:
+        """Background task to process audio buffers on silence timeout."""
+        while self.running:
+            try:
+                await asyncio.sleep(0.1)  # Check every 100ms
+                
+                current_time = time.time()
+                connections_to_process = []
+                
+                # Check all connections for silence timeout
+                for connection_id, connection_info in self.active_connections.items():
+                    if (connection_info.audio_buffer and 
+                        connection_info.last_audio_time > 0 and
+                        current_time - connection_info.last_audio_time >= self.audio_silence_timeout):
+                        
+                        buffer_duration = len(connection_info.audio_buffer) / (16000 * 2)
+                        if buffer_duration >= self.min_buffer_duration:
+                            connections_to_process.append((connection_info, buffer_duration))
+                
+                # Process buffers that have timed out
+                for connection_info, buffer_duration in connections_to_process:
+                    try:
+                        await self._process_buffered_audio(
+                            connection_info, 
+                            f"silence timeout ({buffer_duration:.2f}s buffered)"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error processing timeout buffer for {connection_info.connection_id}: {e}")
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in audio buffer processor task: {e}")
+                await asyncio.sleep(1)
 
     async def run_forever(self) -> None:
         """Run the server indefinitely."""

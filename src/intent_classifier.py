@@ -2,14 +2,16 @@
 Intent Classifier for Voice-driven Claude CLI automation system.
 
 This module handles detecting Claude commands from voice transcriptions using
-keyword matching and regex patterns. It provides confidence scoring and
-command extraction without requiring external dependencies.
+an LLM to understand natural language intent. Provides intelligent command
+detection and extraction without requiring specific keyword patterns.
 """
 
+import asyncio
+import json
 import logging
-import re
+import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -27,65 +29,45 @@ class IntentResult:
 
 class IntentClassifier:
     """
-    Classifies voice transcriptions to detect Claude commands.
+    Classifies voice transcriptions to detect Claude commands using LLM reasoning.
     
-    Uses keyword matching and regex patterns to identify when the user
-    wants to send a command to Claude CLI. Provides confidence scoring
-    based on keyword presence and command structure.
+    Uses Claude CLI to intelligently determine if transcribed speech represents
+    a request that should be forwarded to Claude for processing. This allows for
+    natural language understanding without hardcoded patterns.
     """
     
-    def __init__(self):
-        """Initialize the intent classifier with predefined patterns."""
-        # Claude activation keywords (case-insensitive)
-        self.claude_keywords = [
-            'claude',
-            'hey claude', 
-            'tell claude',
-            'ask claude',
-            'claude please',
-            'run claude',
-            'execute claude'
-        ]
+    def __init__(self, claude_binary: str = "claude"):
+        """Initialize the LLM-based intent classifier."""
+        self.claude_binary = claude_binary
+        self.stats = {
+            'total_classifications': 0,
+            'claude_commands_detected': 0,
+            'classification_failures': 0,
+            'average_response_time': 0.0
+        }
         
-        # Command extraction patterns
-        self.command_patterns = [
-            # "Tell Claude to [command]"
-            r'tell\s+claude\s+to\s+(.+)',
-            # "Ask Claude to [command]" 
-            r'ask\s+claude\s+to\s+(.+)',
-            # "Claude, [command]"
-            r'claude,?\s+(.+)',
-            # "Hey Claude, [command]"
-            r'hey\s+claude,?\s+(.+)',
-            # "Claude please [command]"
-            r'claude\s+please\s+(.+)',
-            # "Run Claude [command]"
-            r'run\s+claude\s+(.+)',
-            # "Execute Claude [command]"
-            r'execute\s+claude\s+(.+)'
-        ]
+        # Test Claude availability
+        self.claude_available = self._test_claude_availability()
         
-        # Compile regex patterns for efficiency
-        self.compiled_patterns = [
-            re.compile(pattern, re.IGNORECASE) 
-            for pattern in self.command_patterns
-        ]
-        
-        # Common false positive filters
-        self.false_positive_patterns = [
-            r'^(um|uh|er|ah|hmm|like|you know)\s*$',
-            r'^(yes|no|okay|ok)\s*$',
-            r'^[^a-zA-Z]*$'  # Only punctuation/numbers
-        ]
-        
-        self.false_positive_compiled = [
-            re.compile(pattern, re.IGNORECASE)
-            for pattern in self.false_positive_patterns
-        ]
+        if not self.claude_available:
+            logger.warning("Claude CLI not available - will use fallback classification")
+    
+    def _test_claude_availability(self) -> bool:
+        """Test if Claude CLI is available."""
+        try:
+            result = subprocess.run(
+                [self.claude_binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
 
     def detect_intent(self, text: str) -> IntentResult:
         """
-        Detect if the given text contains a Claude command.
+        Detect if the given text contains a Claude command using LLM reasoning.
         
         Args:
             text: The transcribed voice text to analyze
@@ -93,6 +75,8 @@ class IntentClassifier:
         Returns:
             IntentResult with classification details and extracted command
         """
+        start_time = asyncio.get_event_loop().time()
+        
         if not text or not text.strip():
             return IntentResult(
                 is_claude_command=False,
@@ -102,11 +86,11 @@ class IntentClassifier:
                 detected_keywords=[]
             )
         
-        # Clean and normalize text
-        cleaned_text = self._clean_text(text)
+        # Clean text
+        cleaned_text = text.strip()
         
-        # Check for false positives
-        if self._is_false_positive(cleaned_text):
+        # Quick filters for obvious non-commands
+        if self._is_obviously_not_command(cleaned_text):
             return IntentResult(
                 is_claude_command=False,
                 command=None,
@@ -115,176 +99,164 @@ class IntentClassifier:
                 detected_keywords=[]
             )
         
-        # Detect keywords
-        detected_keywords = self._find_keywords(cleaned_text)
+        try:
+            # Use LLM to classify intent
+            if self.claude_available:
+                result = self._classify_with_llm(cleaned_text)
+            else:
+                result = self._classify_with_fallback(cleaned_text)
+            
+            # Update stats
+            self.stats['total_classifications'] += 1
+            if result.is_claude_command:
+                self.stats['claude_commands_detected'] += 1
+            
+            processing_time = asyncio.get_event_loop().time() - start_time
+            self._update_avg_response_time(processing_time)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in intent classification: {e}")
+            self.stats['classification_failures'] += 1
+            
+            # Return safe fallback
+            return IntentResult(
+                is_claude_command=False,
+                command=None,
+                confidence=0.0,
+                original_text=text,
+                detected_keywords=['error']
+            )
+
+    def _is_obviously_not_command(self, text: str) -> bool:
+        """Quick filter for obviously non-command text."""
+        text_lower = text.lower().strip()
         
-        # Extract command if keywords found
-        command = None
-        confidence = 0.0
+        # Single words that are clearly not commands
+        non_commands = {'um', 'uh', 'er', 'ah', 'hmm', 'okay', 'ok', 'yes', 'no', 'start'}
+        if text_lower in non_commands:
+            return True
+            
+        # Very short or empty
+        if len(text_lower) < 3:
+            return True
+            
+        return False
+    
+    def _classify_with_llm(self, text: str) -> IntentResult:
+        """Use Claude LLM to classify intent."""
+        prompt = f"""You are analyzing speech transcripts from a voice assistant interface. 
+Your job is to determine if the user's speech represents a request that should be forwarded to Claude AI for processing.
+
+Analyze this transcribed speech: "{text}"
+
+Consider these as Claude commands:
+- Questions asking for information (what, how, where, when, who, why)
+- Requests for explanations, help, or assistance  
+- Commands to perform actions (list, show, tell, explain, create, etc.)
+- Casual requests like "tell me a joke" or "help me with this"
+- Any request that sounds like the user wants an AI assistant to respond
+
+Consider these as NOT Claude commands:
+- Single words like "start", "stop", "yes", "no"
+- Speech artifacts like "um", "uh", "er"  
+- Incomplete fragments
+- Ambient speech not directed at the assistant
+
+Respond with ONLY a JSON object in this exact format:
+{{"is_command": true/false, "confidence": 0.0-1.0, "reasoning": "brief explanation", "command_text": "cleaned version of the command or null"}}"""
+
+        try:
+            result = subprocess.run(
+                [self.claude_binary, "--no-wrap"],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"Claude CLI error: {result.stderr}")
+                return self._classify_with_fallback(text)
+            
+            # Parse JSON response
+            response = json.loads(result.stdout.strip())
+            
+            return IntentResult(
+                is_claude_command=response.get('is_command', False),
+                command=response.get('command_text') or (text if response.get('is_command', False) else None),
+                confidence=float(response.get('confidence', 0.0)),
+                original_text=text,
+                detected_keywords=['llm_classified']
+            )
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Claude response as JSON: {e}")
+            logger.error(f"Raw response: {result.stdout}")
+            return self._classify_with_fallback(text)
+        except Exception as e:
+            logger.error(f"Claude LLM classification failed: {e}")
+            return self._classify_with_fallback(text)
+    
+    def _classify_with_fallback(self, text: str) -> IntentResult:
+        """Fallback classification when LLM is unavailable."""
+        # Simple heuristic-based classification
+        text_lower = text.lower()
         
-        if detected_keywords:
-            command = self._extract_command(cleaned_text)
-            confidence = self._calculate_confidence(
-                cleaned_text, detected_keywords, command
+        # Command indicators
+        command_indicators = [
+            'what', 'how', 'where', 'when', 'who', 'why',
+            'tell me', 'show me', 'help me', 'explain', 
+            'list', 'display', 'get', 'find'
+        ]
+        
+        has_indicator = any(indicator in text_lower for indicator in command_indicators)
+        is_question = text.strip().endswith('?') or text_lower.startswith(('what', 'how', 'where', 'when', 'who', 'why'))
+        
+        if has_indicator or is_question:
+            return IntentResult(
+                is_claude_command=True,
+                command=text,
+                confidence=0.7,
+                original_text=text,
+                detected_keywords=['fallback_heuristic']
             )
         
-        is_claude_command = confidence >= 0.6  # Threshold for classification
-        
         return IntentResult(
-            is_claude_command=is_claude_command,
-            command=command,
-            confidence=confidence,
+            is_claude_command=False,
+            command=None,
+            confidence=0.1,
             original_text=text,
-            detected_keywords=detected_keywords
+            detected_keywords=['fallback_negative']
         )
 
-    def _clean_text(self, text: str) -> str:
-        """Clean and normalize input text."""
-        # Remove extra whitespace and normalize
-        cleaned = ' '.join(text.strip().split())
+    def _update_avg_response_time(self, response_time: float) -> None:
+        """Update average response time statistics."""
+        if self.stats['total_classifications'] == 1:
+            self.stats['average_response_time'] = response_time
+        else:
+            total = self.stats['total_classifications']
+            current_avg = self.stats['average_response_time']
+            self.stats['average_response_time'] = (current_avg * (total - 1) + response_time) / total
+    
+    def get_stats(self) -> Dict[str, any]:
+        """Get classification statistics."""
+        stats = self.stats.copy()
+        if stats['total_classifications'] > 0:
+            stats['command_detection_rate'] = stats['claude_commands_detected'] / stats['total_classifications']
+            stats['failure_rate'] = stats['classification_failures'] / stats['total_classifications']
+        else:
+            stats['command_detection_rate'] = 0.0
+            stats['failure_rate'] = 0.0
         
-        # Remove common speech artifacts
-        artifacts = ['um', 'uh', 'er', 'ah', 'like', 'you know']
-        for artifact in artifacts:
-            # Use word boundaries to avoid partial matches
-            pattern = r'\b' + re.escape(artifact) + r'\b'
-            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-        
-        # Clean up extra spaces
-        cleaned = ' '.join(cleaned.split())
-        
-        return cleaned
-
-    def _is_false_positive(self, text: str) -> bool:
-        """Check if text matches false positive patterns."""
-        for pattern in self.false_positive_compiled:
-            if pattern.match(text.strip()):
-                return True
-        return False
-
-    def _find_keywords(self, text: str) -> List[str]:
-        """Find Claude keywords in the text."""
-        detected = []
-        text_lower = text.lower()
-        
-        for keyword in self.claude_keywords:
-            if keyword in text_lower:
-                detected.append(keyword)
-        
-        return detected
-
-    def _extract_command(self, text: str) -> Optional[str]:
-        """Extract the command portion from the text."""
-        for pattern in self.compiled_patterns:
-            match = pattern.search(text)
-            if match:
-                command = match.group(1).strip()
-                if command and len(command) > 0:
-                    return command
-        
-        # Fallback: if "claude" is mentioned but no pattern matches,
-        # try to extract everything after "claude" - but be more selective
-        claude_match = re.search(r'claude\s+(.+)', text, re.IGNORECASE)
-        if claude_match:
-            command = claude_match.group(1).strip()
-            
-            # Remove common prefixes that might remain
-            prefixes_to_remove = ['please', 'to', ',']
-            for prefix in prefixes_to_remove:
-                if command.lower().startswith(prefix):
-                    command = command[len(prefix):].strip()
-                    break
-            
-            # Only return command if it's not just a single common word
-            common_non_commands = ['commands', 'is', 'are', 'was', 'were', 'the', 'a', 'an']
-            if command and command.lower() not in common_non_commands and len(command) > 2:
-                return command
-        
-        return None
-
-    def _calculate_confidence(
-        self, 
-        text: str, 
-        keywords: List[str], 
-        command: Optional[str]
-    ) -> float:
-        """
-        Calculate confidence score for Claude command detection.
-        
-        Confidence factors:
-        - Keyword presence and specificity
-        - Command extraction success
-        - Text length and structure
-        - Pattern matching quality
-        """
-        if not keywords:
-            return 0.0
-        
-        confidence = 0.0
-        
-        # Base confidence from keywords
-        if 'claude' in keywords:
-            confidence += 0.4
-        
-        # Bonus for specific activation phrases
-        specific_phrases = ['hey claude', 'tell claude', 'ask claude']
-        for phrase in specific_phrases:
-            if phrase in keywords:
-                confidence += 0.3
-                break
-        
-        # Bonus for successful command extraction
-        if command and len(command.strip()) > 0:
-            confidence += 0.3
-            
-            # Additional bonus for meaningful commands
-            if len(command.strip()) > 5:  # Not just single words
-                confidence += 0.1
-        
-        # Pattern matching bonus
-        text_lower = text.lower()
-        pattern_matched = False
-        for pattern in self.compiled_patterns:
-            if pattern.search(text_lower):
-                pattern_matched = True
-                confidence += 0.2
-                break
-        
-        # Penalty for very short text
-        if len(text.strip()) < 5:
-            confidence *= 0.7
-        
-        # Ensure confidence is between 0 and 1
-        return min(1.0, max(0.0, confidence))
-
-    def get_stats(self) -> Dict:
-        """Get statistics about the classifier configuration."""
-        return {
-            'keywords_count': len(self.claude_keywords),
-            'patterns_count': len(self.command_patterns),
-            'keywords': self.claude_keywords,
-            'false_positive_filters': len(self.false_positive_patterns)
-        }
-
-    def add_keyword(self, keyword: str) -> None:
-        """Add a new Claude activation keyword."""
-        if keyword and keyword.lower() not in self.claude_keywords:
-            self.claude_keywords.append(keyword.lower())
-            logger.info(f"Added new keyword: {keyword}")
-
-    def remove_keyword(self, keyword: str) -> bool:
-        """Remove a Claude activation keyword."""
-        keyword_lower = keyword.lower()
-        if keyword_lower in self.claude_keywords:
-            self.claude_keywords.remove(keyword_lower)
-            logger.info(f"Removed keyword: {keyword}")
-            return True
-        return False
+        stats['claude_available'] = self.claude_available
+        return stats
 
 
 # Example usage and testing
 if __name__ == "__main__":
-    # Initialize classifier
+    # Test the LLM-based classifier
     classifier = IntentClassifier()
     
     # Test cases
