@@ -169,7 +169,7 @@ Respond with ONLY a JSON object in this exact format:
 
         try:
             result = subprocess.run(
-                [self.claude_binary, "--no-wrap"],
+                [self.claude_binary, "--print"],
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -180,8 +180,30 @@ Respond with ONLY a JSON object in this exact format:
                 logger.error(f"Claude CLI error: {result.stderr}")
                 return self._classify_with_fallback(text)
             
-            # Parse JSON response
-            response = json.loads(result.stdout.strip())
+            # Parse JSON response (handle markdown code blocks)
+            raw_output = result.stdout.strip()
+            
+            # Extract JSON from markdown code blocks if present
+            if raw_output.startswith('```json'):
+                # Extract content between ```json and ```
+                json_start = raw_output.find('```json') + 7
+                json_end = raw_output.find('```', json_start)
+                if json_end != -1:
+                    json_content = raw_output[json_start:json_end].strip()
+                else:
+                    json_content = raw_output[json_start:].strip()
+            elif raw_output.startswith('```'):
+                # Handle generic code blocks
+                json_start = raw_output.find('```') + 3
+                json_end = raw_output.find('```', json_start)
+                if json_end != -1:
+                    json_content = raw_output[json_start:json_end].strip()
+                else:
+                    json_content = raw_output[json_start:].strip()
+            else:
+                json_content = raw_output
+            
+            response = json.loads(json_content)
             
             return IntentResult(
                 is_claude_command=response.get('is_command', False),

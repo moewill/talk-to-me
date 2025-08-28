@@ -140,7 +140,7 @@ class VoiceGateway:
                 self.port,
                 max_size=self.max_message_size,
                 ping_interval=self.heartbeat_interval,
-                ping_timeout=10
+                ping_timeout=40  # Increased to handle long Claude responses (30s + buffer)
             )
             
             self.running = True
@@ -467,7 +467,7 @@ class VoiceGateway:
 
     async def _execute_claude_command(self, connection_info: ConnectionInfo, command: str) -> None:
         """
-        Execute a Claude CLI command.
+        Execute a Claude CLI command with keepalive support.
         
         Args:
             connection_info: Connection information
@@ -483,9 +483,9 @@ class VoiceGateway:
                 "command": command
             })
             
-            # Execute command
+            # Execute command with keepalive
             self.stats.total_claude_commands += 1
-            claude_result = await self.claude_interface.execute_command(command)
+            claude_result = await self._execute_claude_with_keepalive(websocket, command)
             
             if claude_result.success:
                 self.stats.successful_claude_commands += 1
@@ -503,6 +503,46 @@ class VoiceGateway:
         except Exception as e:
             logger.error(f"Error executing Claude command: {e}")
             await self._send_error(websocket, f"Claude execution error: {str(e)}")
+    
+    async def _execute_claude_with_keepalive(self, websocket, command: str):
+        """Execute Claude command with periodic keepalive messages."""
+        keepalive_interval = 5  # Send keepalive every 5 seconds
+        keepalive_task = None
+        
+        try:
+            # Start keepalive task
+            async def send_keepalive():
+                count = 1
+                while True:
+                    await asyncio.sleep(keepalive_interval)
+                    try:
+                        await self._send_message(websocket, {
+                            "type": "claude_execution",
+                            "status": "processing",
+                            "keepalive": count,
+                            "message": "Claude is processing your request..."
+                        })
+                        count += 1
+                    except Exception as e:
+                        logger.debug(f"Keepalive send failed (expected if execution finished): {e}")
+                        break
+            
+            # Start keepalive in background
+            keepalive_task = asyncio.create_task(send_keepalive())
+            
+            # Execute the actual Claude command
+            claude_result = await self.claude_interface.execute_command(command)
+            
+            return claude_result
+            
+        finally:
+            # Cancel keepalive task
+            if keepalive_task and not keepalive_task.done():
+                keepalive_task.cancel()
+                try:
+                    await keepalive_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _send_message(self, websocket: WebSocketServerProtocol, data: Dict[str, Any]) -> None:
         """
