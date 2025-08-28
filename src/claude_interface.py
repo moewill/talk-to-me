@@ -79,7 +79,7 @@ class ClaudeInterface:
     async def execute_command(
         self, 
         command: str, 
-        model: str = "claude-3-sonnet-20240229",
+        model: str = None,  # Use default model
         additional_args: Optional[List[str]] = None
     ) -> ClaudeResponse:
         """
@@ -183,7 +183,7 @@ class ClaudeInterface:
         # Base command
         cli_args = [self.claude_binary]
         
-        # Add model if specified
+        # Add model if specified (otherwise use default)
         if model:
             cli_args.extend(['--model', model])
         
@@ -201,50 +201,42 @@ class ClaudeInterface:
         start_time = time.time()
         
         try:
-            # Create subprocess
-            process = await asyncio.create_subprocess_exec(
-                *cli_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE
-            )
+            # Use regular subprocess.run in a thread for better compatibility
+            loop = asyncio.get_event_loop()
             
-            # Wait for completion with timeout
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.timeout
-            )
+            def run_claude_sync():
+                return subprocess.run(
+                    cli_command,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout
+                )
+            
+            # Run in thread to avoid blocking
+            result = await loop.run_in_executor(None, run_claude_sync)
             
             execution_time = time.time() - start_time
             
-            # Decode outputs
-            stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
-            stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
+            # Get outputs from result
+            stdout_text = result.stdout or ""
+            stderr_text = result.stderr or ""
             
             # Process the response
             processed_output = self._process_output(stdout_text, stderr_text)
             
             return ClaudeResponse(
-                success=process.returncode == 0,
+                success=result.returncode == 0,
                 output=processed_output,
-                error=stderr_text if process.returncode != 0 else "",
-                exit_code=process.returncode,
+                error=stderr_text if result.returncode != 0 else "",
+                exit_code=result.returncode,
                 execution_time=execution_time,
                 timestamp=start_time,
                 command=original_command,
                 raw_output=stdout_text
             )
             
-        except asyncio.TimeoutError:
+        except subprocess.TimeoutExpired:
             execution_time = time.time() - start_time
-            
-            # Kill the process if it's still running
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
             
             return ClaudeResponse(
                 success=False,

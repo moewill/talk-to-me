@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
+        .connected { background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+        .disconnected { background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        .messages { height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin: 10px 0; }
+        .message { margin: 5px 0; padding: 5px; border-radius: 3px; }
+        .sent { background-color: #e3f2fd; }
+        .received { background-color: #f3e5f5; }
+        input, button { padding: 8px; margin: 5px; }
+        input[type="text"] { width: 300px; }
+        button { background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WebSocket Test Client</h1>
+        
+        <div>
+            <input type="text" id="url" value="ws://localhost:8080" placeholder="WebSocket URL">
+            <button id="connect">Connect</button>
+            <button id="disconnect" disabled>Disconnect</button>
+        </div>
+        
+        <div id="status" class="status disconnected">Disconnected</div>
+        
+        <div class="messages" id="messages"></div>
+        
+        <div>
+            <input type="text" id="messageInput" placeholder="Enter message" disabled>
+            <button id="send" disabled>Send Text</button>
+            <button id="sendAudio" disabled>Send Test Audio</button>
+        </div>
+        
+        <div>
+            <button id="toggleMic" disabled>🎤 Enable Voice Chat</button>
+            <span id="voiceStatus"></span>
+        </div>
+        
+        <div>
+            <button id="clear">Clear Messages</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let connected = false;
+        let audioContext = null;
+        let microphone = null;
+        let processor = null;
+        let voiceChatEnabled = false;
+
+        const urlInput = document.getElementById('url');
+        const connectBtn = document.getElementById('connect');
+        const disconnectBtn = document.getElementById('disconnect');
+        const statusDiv = document.getElementById('status');
+        const messagesDiv = document.getElementById('messages');
+        const messageInput = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('send');
+        const sendAudioBtn = document.getElementById('sendAudio');
+        const clearBtn = document.getElementById('clear');
+        const toggleMicBtn = document.getElementById('toggleMic');
+        const voiceStatus = document.getElementById('voiceStatus');
+
+        function updateStatus(message, isConnected) {
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${isConnected ? 'connected' : 'disconnected'}`;
+            connected = isConnected;
+            
+            connectBtn.disabled = isConnected;
+            disconnectBtn.disabled = !isConnected;
+            messageInput.disabled = !isConnected;
+            sendBtn.disabled = !isConnected;
+            sendAudioBtn.disabled = !isConnected;
+            toggleMicBtn.disabled = !isConnected;
+        }
+
+        function addMessage(message, type) {
+            const div = document.createElement('div');
+            div.className = `message ${type}`;
+            div.innerHTML = `<strong>[${new Date().toLocaleTimeString()}]</strong> ${message}`;
+            messagesDiv.appendChild(div);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function connect() {
+            const url = urlInput.value.trim();
+            if (!url) {
+                alert('Please enter a WebSocket URL');
+                return;
+            }
+
+            try {
+                ws = new WebSocket(url);
+                
+                ws.onopen = function(event) {
+                    updateStatus('Connected', true);
+                    addMessage('Connected to server', 'received');
+                };
+                
+                ws.onmessage = function(event) {
+                    if (typeof event.data === 'string') {
+                        try {
+                            const data = JSON.parse(event.data);
+                            addMessage(`JSON: ${JSON.stringify(data, null, 2)}`, 'received');
+                        } catch (e) {
+                            addMessage(`Text: ${event.data}`, 'received');
+                        }
+                    } else {
+                        addMessage(`Binary data received: ${event.data.size} bytes`, 'received');
+                    }
+                };
+                
+                ws.onclose = function(event) {
+                    updateStatus('Disconnected', false);
+                    addMessage(`Connection closed: ${event.code} ${event.reason}`, 'received');
+                };
+                
+                ws.onerror = function(error) {
+                    updateStatus('Error', false);
+                    addMessage(`Error: ${error}`, 'received');
+                };
+                
+                updateStatus('Connecting...', false);
+                
+            } catch (error) {
+                addMessage(`Connection error: ${error}`, 'received');
+            }
+        }
+
+        function disconnect() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+        }
+
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message || !connected) return;
+
+            const data = {
+                type: "text_message",
+                content: message,
+                timestamp: Date.now()
+            };
+
+            try {
+                ws.send(JSON.stringify(data));
+                addMessage(`Sent: ${message}`, 'sent');
+                messageInput.value = '';
+            } catch (error) {
+                addMessage(`Send error: ${error}`, 'received');
+            }
+        }
+
+        function sendTestAudio() {
+            if (!connected) return;
+
+            // Generate test audio data (sine wave)
+            const sampleRate = 16000;
+            const duration = 2;
+            const frequency = 440;
+            const samples = sampleRate * duration;
+            
+            const audioData = new Int16Array(samples);
+            for (let i = 0; i < samples; i++) {
+                audioData[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 32767;
+            }
+
+            try {
+                ws.send(audioData.buffer);
+                addMessage(`Sent test audio: ${audioData.buffer.byteLength} bytes`, 'sent');
+            } catch (error) {
+                addMessage(`Audio send error: ${error}`, 'received');
+            }
+        }
+
+        function clearMessages() {
+            messagesDiv.innerHTML = '';
+        }
+
+        async function toggleVoiceChat() {
+            if (!voiceChatEnabled) {
+                await startVoiceChat();
+            } else {
+                stopVoiceChat();
+            }
+        }
+
+        async function startVoiceChat() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                microphone = audioContext.createMediaStreamSource(stream);
+                
+                // Create a script processor for real-time audio processing
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = function(event) {
+                    if (!connected || !ws) return;
+                    
+                    const inputData = event.inputBuffer.getChannelData(0);
+                    
+                    // Convert float32 to int16 PCM
+                    const pcmData = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        pcmData[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                    }
+                    
+                    // Send raw PCM data
+                    ws.send(pcmData.buffer);
+                };
+                
+                microphone.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                voiceChatEnabled = true;
+                toggleMicBtn.textContent = '🔴 Disable Voice Chat';
+                voiceStatus.textContent = '🎙️ Voice chat active - speak naturally';
+                addMessage('Voice chat enabled - continuous streaming', 'sent');
+                
+            } catch (error) {
+                addMessage(`Microphone error: ${error.message}`, 'received');
+                console.error('Error accessing microphone:', error);
+            }
+        }
+
+        function stopVoiceChat() {
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (microphone) {
+                microphone.disconnect();
+                microphone = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            
+            voiceChatEnabled = false;
+            toggleMicBtn.textContent = '🎤 Enable Voice Chat';
+            voiceStatus.textContent = '';
+            addMessage('Voice chat disabled', 'sent');
+        }
+
+        // Event listeners
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        sendBtn.addEventListener('click', sendMessage);
+        sendAudioBtn.addEventListener('click', sendTestAudio);
+        clearBtn.addEventListener('click', clearMessages);
+        toggleMicBtn.addEventListener('click', toggleVoiceChat);
+
+        messageInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // Initialize
+        updateStatus('Disconnected', false);
+    </script>
+</body>
+</html>

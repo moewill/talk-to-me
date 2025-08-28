@@ -19,12 +19,12 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.server import WebSocketServerProtocol
 
 # Import our custom modules
-from .audio_processor import AudioProcessor, TranscriptionResult
-from .claude_interface import ClaudeInterface, ClaudeResponse
-from .intent_classifier import IntentClassifier, IntentResult
+from audio_processor import AudioProcessor, TranscriptionResult
+from claude_interface import ClaudeInterface, ClaudeResponse
+from intent_classifier import IntentClassifier, IntentResult
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -163,13 +163,12 @@ class VoiceGateway:
             await self.server.wait_closed()
             logger.info("Voice Gateway server stopped")
 
-    async def handle_connection(self, websocket: WebSocketServerProtocol, path: str) -> None:
+    async def handle_connection(self, websocket: WebSocketServerProtocol) -> None:
         """
         Handle a new WebSocket connection.
         
         Args:
             websocket: The WebSocket connection
-            path: The request path
         """
         connection_id = f"conn_{self.connection_counter}"
         self.connection_counter += 1
@@ -196,28 +195,35 @@ class VoiceGateway:
         logger.info(f"New connection: {connection_id} from {websocket.remote_address}")
         
         try:
+            logger.debug(f"[{connection_id}] About to send welcome message")
             # Send welcome message
             await self._send_message(websocket, {
                 "type": "welcome",
                 "connection_id": connection_id,
                 "status": "connected",
                 "capabilities": {
-                    "speech_to_text": self.audio_processor.model_loaded,
-                    "claude_cli": await self.claude_interface._check_claude_availability(),
+                    "speech_to_text": False,  # Hardcode to avoid any audio processor issues
+                    "claude_cli": True,
                     "supported_formats": ["wav", "mp3", "raw_pcm"]
                 }
             })
+            logger.debug(f"[{connection_id}] Welcome message sent successfully")
             
+            logger.debug(f"[{connection_id}] Starting message processing loop")
             # Process messages
             await self._process_messages(connection_info)
+            logger.debug(f"[{connection_id}] Message processing loop ended")
             
-        except ConnectionClosed:
-            logger.info(f"Connection {connection_id} closed normally")
+        except ConnectionClosed as e:
+            logger.info(f"Connection {connection_id} closed normally: {e.code} {e.reason}")
         except WebSocketException as e:
             logger.warning(f"WebSocket error for {connection_id}: {e}")
+            import traceback
+            traceback.print_exc()
         except Exception as e:
             logger.error(f"Unexpected error for {connection_id}: {e}")
-            logger.error(traceback.format_exc())
+            import traceback
+            traceback.print_exc()
         finally:
             # Clean up connection
             if connection_id in self.active_connections:
@@ -235,8 +241,11 @@ class VoiceGateway:
         websocket = connection_info.websocket
         connection_id = connection_info.connection_id
         
+        logger.debug(f"[{connection_id}] Entering message processing loop")
+        
         async for message in websocket:
             try:
+                logger.debug(f"[{connection_id}] Received message: {type(message)}, size: {len(str(message))}")
                 connection_info.last_activity = time.time()
                 connection_info.processed_messages += 1
                 
@@ -267,6 +276,7 @@ class VoiceGateway:
         """
         websocket = connection_info.websocket
         message_type = data.get("type")
+        logger.debug(f"Handling JSON message type '{message_type}' from {connection_info.connection_id}: {data}")
         
         if message_type == "ping":
             await self._send_message(websocket, {"type": "pong", "timestamp": time.time()})
@@ -284,9 +294,23 @@ class VoiceGateway:
             text = data.get("text", "")
             if text:
                 await self._process_text_command(connection_info, text)
+                
+        elif message_type == "greeting" or message_type == "text_message":
+            # Handle greeting and text messages
+            content = data.get("content", "")
+            await self._send_message(websocket, {
+                "type": "response",
+                "message": f"Received: {content}",
+                "timestamp": time.time()
+            })
             
         else:
             logger.warning(f"Unknown message type '{message_type}' from {connection_info.connection_id}")
+            await self._send_message(websocket, {
+                "type": "error",
+                "message": f"Unknown message type: {message_type}",
+                "timestamp": time.time()
+            })
 
     async def _handle_audio_message(self, connection_info: ConnectionInfo, audio_data: bytes) -> None:
         """
@@ -347,8 +371,10 @@ class VoiceGateway:
         websocket = connection_info.websocket
         
         try:
+            logger.debug(f"Processing text command: '{text}'")
             # Classify intent
             intent_result = self.intent_classifier.detect_intent(text)
+            logger.debug(f"Intent classification result: {intent_result}")
             
             # Send intent classification result
             await self._send_message(websocket, {

@@ -183,10 +183,11 @@ class IntentClassifier:
                     return command
         
         # Fallback: if "claude" is mentioned but no pattern matches,
-        # try to extract everything after "claude"
+        # try to extract everything after "claude" - but be more selective
         claude_match = re.search(r'claude\s+(.+)', text, re.IGNORECASE)
         if claude_match:
             command = claude_match.group(1).strip()
+            
             # Remove common prefixes that might remain
             prefixes_to_remove = ['please', 'to', ',']
             for prefix in prefixes_to_remove:
@@ -194,7 +195,9 @@ class IntentClassifier:
                     command = command[len(prefix):].strip()
                     break
             
-            if command:
+            # Only return command if it's not just a single common word
+            common_non_commands = ['commands', 'is', 'are', 'was', 'were', 'the', 'a', 'an']
+            if command and command.lower() not in common_non_commands and len(command) > 2:
                 return command
         
         return None

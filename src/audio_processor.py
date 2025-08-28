@@ -136,15 +136,27 @@ class AudioProcessor:
             return False
             
         try:
-            # Load model in a thread to avoid blocking
-            loop = asyncio.get_event_loop()
-            self.model = await loop.run_in_executor(
-                None, 
-                self._load_model_sync
-            )
-            self.model_loaded = True
-            logger.info(f"Whisper model '{self.model_name}' loaded successfully")
-            return True
+            # Load model directly (bypass thread executor to avoid pickle issues)
+            import whisper
+            
+            # Patch torch.load temporarily for model loading
+            import torch
+            original_load = torch.load
+            
+            def whisper_compatible_load(*args, **kwargs):
+                kwargs['weights_only'] = False
+                return original_load(*args, **kwargs)
+            
+            torch.load = whisper_compatible_load
+            
+            try:
+                self.model = whisper.load_model(self.model_name, device=self.device)
+                self.model_loaded = True
+                logger.info(f"Whisper model '{self.model_name}' loaded successfully")
+                return True
+            finally:
+                # Restore original torch.load
+                torch.load = original_load
             
         except Exception as e:
             logger.error(f"Failed to load Whisper model: {e}")
@@ -152,7 +164,30 @@ class AudioProcessor:
 
     def _load_model_sync(self):
         """Load Whisper model synchronously."""
-        return whisper.load_model(self.model_name, device=self.device)
+        try:
+            # Use weights_only=False to avoid the weights loading error
+            # This is safe since we're loading from the official Whisper repository
+            import torch
+            
+            # Temporarily set torch loading to allow pickle loading
+            original_load = torch.load
+            
+            def safe_load(*args, **kwargs):
+                kwargs['weights_only'] = False
+                return original_load(*args, **kwargs)
+            
+            torch.load = safe_load
+            
+            try:
+                model = whisper.load_model(self.model_name, device=self.device)
+                return model
+            finally:
+                # Restore original torch.load
+                torch.load = original_load
+                
+        except Exception as e:
+            logger.error(f"Model loading error: {e}")
+            raise
 
     async def transcribe(
         self, 
@@ -203,10 +238,8 @@ class AudioProcessor:
             
             processing_time = time.time() - start_time
             
-            # Update statistics
-            self._update_stats(result, processing_time, duration)
-            
-            return TranscriptionResult(
+            # Create TranscriptionResult
+            transcription_result = TranscriptionResult(
                 success=True,
                 text=result["text"].strip(),
                 confidence=self._calculate_confidence(result),
@@ -215,6 +248,11 @@ class AudioProcessor:
                 error=None,
                 audio_duration=duration
             )
+            
+            # Update statistics
+            self._update_stats(transcription_result, processing_time, duration)
+            
+            return transcription_result
             
         except Exception as e:
             processing_time = time.time() - start_time
