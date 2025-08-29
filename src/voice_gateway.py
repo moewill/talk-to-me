@@ -14,14 +14,14 @@ import traceback
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Set
 
-import websockets
+from websockets.asyncio.server import serve, ServerConnection
 from websockets.exceptions import ConnectionClosed, WebSocketException
-from websockets.server import WebSocketServerProtocol
 
 # Import our custom modules
 from audio_processor import AudioProcessor, TranscriptionResult
 from claude_interface import ClaudeInterface, ClaudeResponse
 from intent_classifier import IntentClassifier, IntentResult
+from sentence_detector import SentenceDetector, SentenceBoundaryResult
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ConnectionInfo:
     """Information about a WebSocket connection."""
-    websocket: WebSocketServerProtocol
+    websocket: ServerConnection
     connection_id: str
     connected_at: float
     last_activity: float
@@ -39,6 +39,8 @@ class ConnectionInfo:
     audio_buffer: bytes
     last_audio_time: float
     buffer_start_time: Optional[float]
+    partial_transcription: str = ""  # Accumulating partial transcription
+    partial_transcription_start: Optional[float] = None  # When partial transcription started
 
 
 @dataclass
@@ -65,7 +67,7 @@ class VoiceGateway:
         self,
         host: str = "localhost",
         port: int = 8080,
-        whisper_model: str = "base",
+        whisper_model: str = "medium",
         claude_binary: str = "claude"
     ):
         """
@@ -84,6 +86,7 @@ class VoiceGateway:
         self.audio_processor = AudioProcessor(model_name=whisper_model)
         self.intent_classifier = IntentClassifier()
         self.claude_interface = ClaudeInterface(claude_binary=claude_binary)
+        self.sentence_detector = SentenceDetector(claude_binary=claude_binary)
         
         # Connection management
         self.active_connections: Dict[str, ConnectionInfo] = {}
@@ -106,9 +109,12 @@ class VoiceGateway:
         self.heartbeat_interval = 30  # seconds
         
         # Audio buffering configuration
-        self.audio_buffer_duration = 2.0  # seconds - buffer audio for 2 seconds before processing
-        self.audio_silence_timeout = 0.5  # seconds - process buffer if no audio for 500ms
-        self.min_buffer_duration = 0.5   # seconds - minimum audio length to process
+        self.audio_buffer_duration = 3.0  # seconds - buffer audio for optimal balance (accuracy vs responsiveness)
+        self.audio_silence_timeout = 0.8  # seconds - process buffer if no audio for 800ms 
+        self.min_buffer_duration = 0.8   # seconds - minimum audio length to process
+        
+        # Sentence completion timeout
+        self.sentence_timeout = 5.0  # seconds - force sentence completion after 5 seconds of partial text
         
         # Server state
         self.server = None
@@ -134,7 +140,7 @@ class VoiceGateway:
             # Start WebSocket server
             logger.info(f"Starting Voice Gateway server on {self.host}:{self.port}")
             
-            self.server = await websockets.serve(
+            self.server = await serve(
                 self.handle_connection,
                 self.host,
                 self.port,
@@ -172,7 +178,7 @@ class VoiceGateway:
             await self.server.wait_closed()
             logger.info("Voice Gateway server stopped")
 
-    async def handle_connection(self, websocket: WebSocketServerProtocol) -> None:
+    async def handle_connection(self, websocket: ServerConnection) -> None:
         """
         Handle a new WebSocket connection.
         
@@ -197,7 +203,9 @@ class VoiceGateway:
             processed_messages=0,
             audio_buffer=b"",
             last_audio_time=0.0,
-            buffer_start_time=None
+            buffer_start_time=None,
+            partial_transcription="",
+            partial_transcription_start=None
         )
         
         self.active_connections[connection_id] = connection_info
@@ -217,6 +225,11 @@ class VoiceGateway:
                     "speech_to_text": False,  # Hardcode to avoid any audio processor issues
                     "claude_cli": True,
                     "supported_formats": ["wav", "mp3", "raw_pcm"]
+                },
+                "config": {
+                    "whisper_model": self.audio_processor.model_name,
+                    "buffer_duration": self.audio_buffer_duration,
+                    "silence_timeout": self.audio_silence_timeout
                 }
             })
             logger.debug(f"[{connection_id}] Welcome message sent successfully")
@@ -406,19 +419,9 @@ class VoiceGateway:
                 await self._send_error(websocket, f"Transcription failed: {transcription_result.error}")
                 return
             
-            # Send transcription result
-            await self._send_message(websocket, {
-                "type": "transcription",
-                "text": transcription_result.text,
-                "confidence": transcription_result.confidence,
-                "language": transcription_result.language,
-                "processing_time": transcription_result.processing_time,
-                "buffer_duration": buffer_duration
-            })
-            
-            # Process the transcribed text
+            # Use sentence boundary detection for natural transcription display
             if transcription_result.text.strip():
-                await self._process_text_command(connection_info, transcription_result.text)
+                await self._process_transcription_with_sentences(connection_info, transcription_result.text, buffer_duration, transcription_result)
             
             # Update processing time stats
             processing_time = time.time() - start_time
@@ -430,6 +433,106 @@ class VoiceGateway:
             # Clear buffer on error to prevent stuck state
             connection_info.audio_buffer = b""
             connection_info.buffer_start_time = None
+    
+    async def _process_transcription_with_sentences(
+        self, 
+        connection_info: ConnectionInfo, 
+        new_text: str, 
+        buffer_duration: float,
+        transcription_result: TranscriptionResult
+    ) -> None:
+        """
+        Process transcription using sentence boundary detection for natural display.
+        """
+        websocket = connection_info.websocket
+        
+        try:
+            # Accumulate the new transcription with any existing partial text
+            accumulated_text = (connection_info.partial_transcription + " " + new_text).strip()
+            
+            # Detect sentence boundaries in the accumulated text
+            logger.debug(f"[{connection_info.connection_id}] Accumulated text for sentence detection: '{accumulated_text}'")
+            boundary_result = self.sentence_detector.detect_sentence_boundary(accumulated_text)
+            logger.debug(f"[{connection_info.connection_id}] Sentence boundary result: {len(boundary_result.completed_sentences)} complete, fragment: '{boundary_result.remaining_fragment}', confidence: {boundary_result.confidence}")
+            
+            # Send completed sentences as finalized transcriptions
+            for completed_sentence in boundary_result.completed_sentences:
+                await self._send_message(websocket, {
+                    "type": "sentence_complete",
+                    "complete_sentence": completed_sentence,
+                    "confidence": boundary_result.confidence,
+                    "processing_time": transcription_result.processing_time
+                })
+                
+                # Process completed sentences for Claude commands
+                await self._process_text_command(connection_info, completed_sentence)
+            
+            # Send partial transcription update if there's a remaining fragment
+            if boundary_result.remaining_fragment:
+                current_time = time.time()
+                
+                # Check if we need to start timing the partial transcription
+                if not connection_info.partial_transcription:
+                    connection_info.partial_transcription_start = current_time
+                
+                # Check for sentence timeout - force completion if partial has been waiting too long
+                if (connection_info.partial_transcription_start and 
+                    current_time - connection_info.partial_transcription_start > self.sentence_timeout):
+                    
+                    # Force completion of the partial transcription
+                    await self._send_message(websocket, {
+                        "type": "sentence_complete",
+                        "complete_sentence": boundary_result.remaining_fragment,
+                        "confidence": 0.5,  # Lower confidence for timeout completion
+                        "processing_time": transcription_result.processing_time,
+                        "forced_completion": True
+                    })
+                    
+                    # Process the timed-out sentence for Claude commands
+                    await self._process_text_command(connection_info, boundary_result.remaining_fragment)
+                    
+                    # Clear partial transcription
+                    connection_info.partial_transcription = ""
+                    connection_info.partial_transcription_start = None
+                else:
+                    # Send normal partial update
+                    await self._send_message(websocket, {
+                        "type": "transcription_stream", 
+                        "partial_text": boundary_result.remaining_fragment,
+                        "is_sentence_complete": False,
+                        "sentence_boundary_confidence": boundary_result.confidence,
+                        "buffer_duration": buffer_duration
+                    })
+                    
+                    # Update the stored partial transcription
+                    connection_info.partial_transcription = boundary_result.remaining_fragment
+            else:
+                # No remaining fragment - clear partial transcription
+                connection_info.partial_transcription = ""
+                connection_info.partial_transcription_start = None
+            
+            # Also send the raw transcription for debug purposes
+            await self._send_message(websocket, {
+                "type": "transcription",
+                "text": new_text,
+                "confidence": transcription_result.confidence,
+                "language": transcription_result.language,
+                "processing_time": transcription_result.processing_time,
+                "buffer_duration": buffer_duration
+            })
+            
+        except Exception as e:
+            logger.error(f"Error processing transcription with sentences: {e}")
+            # Fallback to simple transcription processing
+            await self._send_message(websocket, {
+                "type": "transcription",
+                "text": new_text,
+                "confidence": transcription_result.confidence,
+                "language": transcription_result.language,
+                "processing_time": transcription_result.processing_time,
+                "buffer_duration": buffer_duration
+            })
+            await self._process_text_command(connection_info, new_text)
 
     async def _process_text_command(self, connection_info: ConnectionInfo, text: str) -> None:
         """
@@ -544,7 +647,7 @@ class VoiceGateway:
                 except asyncio.CancelledError:
                     pass
 
-    async def _send_message(self, websocket: WebSocketServerProtocol, data: Dict[str, Any]) -> None:
+    async def _send_message(self, websocket: ServerConnection, data: Dict[str, Any]) -> None:
         """
         Send a JSON message to a WebSocket.
         
@@ -558,7 +661,7 @@ class VoiceGateway:
         except Exception as e:
             logger.error(f"Error sending message: {e}")
 
-    async def _send_error(self, websocket: WebSocketServerProtocol, error_message: str) -> None:
+    async def _send_error(self, websocket: ServerConnection, error_message: str) -> None:
         """
         Send an error message to a WebSocket.
         
@@ -590,6 +693,7 @@ class VoiceGateway:
             "audio_processor": self.audio_processor.get_stats(),
             "intent_classifier": self.intent_classifier.get_stats(),
             "claude_interface": self.claude_interface.get_stats(),
+            "sentence_detector": self.sentence_detector.get_stats(),
             "uptime": time.time() - self.stats.uptime_start,
             "active_connections": list(self.active_connections.keys())
         }
@@ -695,7 +799,7 @@ async def main():
     parser = argparse.ArgumentParser(description="Voice Gateway Server")
     parser.add_argument("--host", default="localhost", help="Host to bind the server")
     parser.add_argument("--port", type=int, default=8080, help="Port to bind the server")
-    parser.add_argument("--whisper-model", default="base", help="Whisper model to use")
+    parser.add_argument("--whisper-model", default="medium", help="Whisper model to use (tiny/base/small/medium/large)")
     parser.add_argument("--claude-binary", default="claude", help="Path to Claude CLI binary")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     

@@ -10,12 +10,49 @@
         .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
         .connected { background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
         .disconnected { background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        .connecting { background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404; }
+        .error { background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        .debug-toggle {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            background-color: #6c757d;
+            color: white;
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .debug-toggle:hover { background-color: #5a6268; }
+        .debug-toggle.active { background-color: #28a745; }
+        .debug-toggle.active:hover { background-color: #218838; }
+        .partial { opacity: 0.8; border-left: 3px solid #007bff; }
+        .typing-indicator {
+            color: #007bff;
+            animation: typing 1.5s infinite;
+            font-weight: bold;
+        }
+        @keyframes typing {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0.3; }
+        }
         .messages { height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; margin: 10px 0; }
         .message { margin: 5px 0; padding: 5px; border-radius: 3px; }
-        .sent { background-color: #e3f2fd; }
-        .received { background-color: #f3e5f5; }
+        .sent { background-color: #e3f2fd; border-left: 3px solid #2196f3; }
+        .received { background-color: #f3e5f5; border-left: 3px solid #9c27b0; }
+        .message strong { color: #666; font-size: 0.9em; }
+        .confidence-low { border-left-color: #ff9800 !important; }
+        .confidence-medium { border-left-color: #2196f3 !important; }
+        .confidence-high { border-left-color: #4caf50 !important; }
+        .transcription-error { background-color: #ffebee; border-left: 3px solid #f44336; }
         input, button { padding: 8px; margin: 5px; }
-        input[type="text"] { width: 300px; }
         button { background-color: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
         button:hover { background-color: #0056b3; }
         button:disabled { background-color: #ccc; cursor: not-allowed; }
@@ -36,19 +73,33 @@
         <div class="messages" id="messages"></div>
         
         <div>
-            <input type="text" id="messageInput" placeholder="Enter message" disabled>
-            <button id="send" disabled>Send Text</button>
             <button id="sendAudio" disabled>Send Test Audio</button>
         </div>
         
         <div>
-            <button id="toggleMic" disabled>🎤 Enable Voice Chat</button>
             <span id="voiceStatus"></span>
         </div>
         
         <div>
             <button id="clear">Clear Messages</button>
         </div>
+        
+        <!-- Performance Metrics Section -->
+        <div style="margin-top: 20px; padding: 15px; background-color: #f5f5f5; border-radius: 5px;">
+            <h3>Performance Metrics</h3>
+            <div id="performanceMetrics">
+                <div>Whisper Model: <span id="modelInfo">-</span></div>
+                <div>Audio Buffer: <span id="bufferInfo">-</span></div>
+                <div>Transcription Time: <span id="transcriptionTime">-</span></div>
+                <div>LLM Classification Time: <span id="llmTime">-</span></div>
+                <div>Claude Execution Time: <span id="claudeTime">-</span></div>
+                <div>Total Processing: <span id="totalTime">-</span></div>
+                <div>Connection Quality: <span id="connectionQuality">-</span></div>
+            </div>
+        </div>
+        
+        <!-- Debug Toggle Button -->
+        <button id="debugToggle" class="debug-toggle" title="Toggle Debug Messages">🔧</button>
     </div>
 
     <script>
@@ -64,32 +115,204 @@
         const disconnectBtn = document.getElementById('disconnect');
         const statusDiv = document.getElementById('status');
         const messagesDiv = document.getElementById('messages');
-        const messageInput = document.getElementById('messageInput');
-        const sendBtn = document.getElementById('send');
         const sendAudioBtn = document.getElementById('sendAudio');
         const clearBtn = document.getElementById('clear');
-        const toggleMicBtn = document.getElementById('toggleMic');
         const voiceStatus = document.getElementById('voiceStatus');
+        const debugToggle = document.getElementById('debugToggle');
+        
+        // Performance tracking
+        let processingStartTime = 0;
+        let transcriptionStartTime = 0;
+        let metrics = {
+            transcriptionTime: 0,
+            llmTime: 0,
+            claudeTime: 0,
+            totalTime: 0,
+            bufferDuration: 0,
+            modelName: 'unknown'
+        };
 
-        function updateStatus(message, isConnected) {
-            statusDiv.textContent = message;
-            statusDiv.className = `status ${isConnected ? 'connected' : 'disconnected'}`;
-            connected = isConnected;
+        let previousStatus = { message: 'Disconnected', state: 'disconnected' };
+        let errorTimeout = null;
+        let retryCount = 0;
+        let maxRetries = 5;
+        let retryTimeout = null;
+        
+        // Debug system
+        let debugMode = false;
+
+        function toggleDebugMode() {
+            debugMode = !debugMode;
+            debugToggle.classList.toggle('active', debugMode);
+            debugToggle.title = debugMode ? 'Hide Debug Messages' : 'Show Debug Messages';
             
-            connectBtn.disabled = isConnected;
-            disconnectBtn.disabled = !isConnected;
-            messageInput.disabled = !isConnected;
-            sendBtn.disabled = !isConnected;
-            sendAudioBtn.disabled = !isConnected;
-            toggleMicBtn.disabled = !isConnected;
+            // Update existing messages visibility
+            const messages = messagesDiv.querySelectorAll('.message');
+            messages.forEach(msg => {
+                if (msg.classList.contains('debug')) {
+                    msg.style.display = debugMode ? 'block' : 'none';
+                }
+            });
         }
 
-        function addMessage(message, type) {
+        function shouldDisplayDebugMessage(messageType) {
+            const debugMessageTypes = [
+                'welcome', 'processing', 'transcription', 'intent', 
+                'claude_execution', 'claude_result', 'stats', 'claude_test',
+                'transcription_stream'  // Partial transcription updates are debug info
+            ];
+            return debugMessageTypes.includes(messageType);
+        }
+
+        // Real-time transcription state
+        let currentPartialMessage = null;
+
+        function updatePartialTranscription(partial_text) {
+            if (currentPartialMessage) {
+                // Update existing partial message
+                const timeElement = currentPartialMessage.querySelector('strong');
+                const timestamp = timeElement ? timeElement.textContent : `[${new Date().toLocaleTimeString()}]`;
+                currentPartialMessage.innerHTML = `${timestamp} ${partial_text}<span class="typing-indicator">...</span>`;
+            } else {
+                // Create new partial message
+                currentPartialMessage = document.createElement('div');
+                currentPartialMessage.className = 'message sent partial';
+                currentPartialMessage.innerHTML = `<strong>[${new Date().toLocaleTimeString()}]</strong> ${partial_text}<span class="typing-indicator">...</span>`;
+                messagesDiv.appendChild(currentPartialMessage);
+                
+                // Limit message history for performance (keep last 100 messages)
+                const messages = messagesDiv.querySelectorAll('.message');
+                if (messages.length > 100) {
+                    // Remove oldest messages, but preserve current partial message
+                    for (let i = 0; i < messages.length - 100; i++) {
+                        if (messages[i] !== currentPartialMessage) {
+                            messages[i].remove();
+                        }
+                    }
+                }
+                
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+        }
+
+        function completeSentence(sentence, confidence = 1.0) {
+            if (currentPartialMessage) {
+                // Convert partial message to completed sentence
+                const timeElement = currentPartialMessage.querySelector('strong');
+                const timestamp = timeElement ? timeElement.textContent : `[${new Date().toLocaleTimeString()}]`;
+                currentPartialMessage.innerHTML = `${timestamp} ${sentence}`;
+                currentPartialMessage.classList.remove('partial');
+                
+                // Add confidence indicator
+                addConfidenceClass(currentPartialMessage, confidence);
+                
+                currentPartialMessage = null;
+            } else {
+                // Add completed sentence directly
+                const div = addMessage(sentence, 'sent');
+                addConfidenceClass(div, confidence);
+            }
+        }
+
+        function addConfidenceClass(element, confidence) {
+            // Add confidence-based styling
+            if (confidence >= 0.8) {
+                element.classList.add('confidence-high');
+            } else if (confidence >= 0.5) {
+                element.classList.add('confidence-medium');
+            } else {
+                element.classList.add('confidence-low');
+            }
+        }
+
+        function updateStatus(message, state = 'disconnected') {
+            // Clear any existing error timeout
+            if (errorTimeout) {
+                clearTimeout(errorTimeout);
+                errorTimeout = null;
+            }
+            
+            // Store the current status if it's not an error
+            if (state !== 'error') {
+                previousStatus = { message, state };
+            }
+            
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${state}`;
+            connected = (state === 'connected');
+            
+            // Update button states (keeping existing logic for remaining buttons)
+            connectBtn.disabled = connected;
+            disconnectBtn.disabled = !connected;
+            sendAudioBtn.disabled = !connected;
+        }
+
+        function showTemporaryError(errorMessage, duration = 3000) {
+            updateStatus(errorMessage, 'error');
+            
+            // Restore previous status after duration
+            errorTimeout = setTimeout(() => {
+                updateStatus(previousStatus.message, previousStatus.state);
+                errorTimeout = null;
+            }, duration);
+        }
+
+        function attemptReconnection() {
+            if (retryCount >= maxRetries) {
+                updateStatus('Connection failed after multiple attempts. Please refresh the page.', 'error');
+                return;
+            }
+            
+            retryCount++;
+            const delay = Math.min(1000 * Math.pow(2, retryCount - 1), 10000); // Exponential backoff, max 10s
+            
+            updateStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s... (attempt ${retryCount}/${maxRetries})`, 'connecting');
+            
+            retryTimeout = setTimeout(() => {
+                updateStatus('Attempting to reconnect...', 'connecting');
+                connect();
+            }, delay);
+        }
+
+        function addMessage(message, type, isDebug = false) {
             const div = document.createElement('div');
-            div.className = `message ${type}`;
+            div.className = `message ${type}${isDebug ? ' debug' : ''}`;
             div.innerHTML = `<strong>[${new Date().toLocaleTimeString()}]</strong> ${message}`;
+            
+            // Only show debug messages if debug mode is on
+            if (isDebug && !debugMode) {
+                div.style.display = 'none';
+            }
+            
             messagesDiv.appendChild(div);
+            
+            // Limit message history for performance (keep last 100 messages)
+            const messages = messagesDiv.querySelectorAll('.message');
+            if (messages.length > 100) {
+                // Remove oldest messages
+                for (let i = 0; i < messages.length - 100; i++) {
+                    messages[i].remove();
+                }
+            }
+            
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            return div;
+        }
+        
+        function updatePerformanceMetrics() {
+            document.getElementById('modelInfo').textContent = metrics.modelName;
+            document.getElementById('bufferInfo').textContent = `${metrics.bufferDuration}s`;
+            document.getElementById('transcriptionTime').textContent = `${metrics.transcriptionTime.toFixed(2)}s`;
+            document.getElementById('llmTime').textContent = `${metrics.llmTime.toFixed(2)}s`;
+            document.getElementById('claudeTime').textContent = `${metrics.claudeTime.toFixed(2)}s`;
+            document.getElementById('totalTime').textContent = `${metrics.totalTime.toFixed(2)}s`;
+            
+            // Calculate connection quality based on processing times
+            let quality = 'Good';
+            if (metrics.transcriptionTime > 3) quality = 'Slow Transcription';
+            if (metrics.claudeTime > 10) quality = 'Slow Claude';
+            if (metrics.totalTime > 15) quality = 'Poor';
+            document.getElementById('connectionQuality').textContent = quality;
         }
 
         function connect() {
@@ -102,16 +325,77 @@
             try {
                 ws = new WebSocket(url);
                 
-                ws.onopen = function(event) {
-                    updateStatus('Connected', true);
+                ws.onopen = async function(event) {
+                    updateStatus('Connected', 'connected');
                     addMessage('Connected to server', 'received');
+                    
+                    // Reset retry count on successful connection
+                    retryCount = 0;
+                    if (retryTimeout) {
+                        clearTimeout(retryTimeout);
+                        retryTimeout = null;
+                    }
+                    
+                    // Automatically start voice chat after successful connection
+                    try {
+                        await startVoiceChat();
+                    } catch (error) {
+                        addMessage(`Failed to start voice chat: ${error.message}`, 'received');
+                        console.error('Voice chat initialization error:', error);
+                    }
                 };
                 
                 ws.onmessage = function(event) {
                     if (typeof event.data === 'string') {
                         try {
                             const data = JSON.parse(event.data);
-                            addMessage(`JSON: ${JSON.stringify(data, null, 2)}`, 'received');
+                            
+                            // Track performance metrics
+                            if (data.type === 'welcome') {
+                                metrics.modelName = data.config?.whisper_model || 'unknown';
+                                metrics.bufferDuration = data.config?.buffer_duration || 0;
+                                updatePerformanceMetrics();
+                            } else if (data.type === 'processing' && data.status === 'transcribing') {
+                                transcriptionStartTime = Date.now();
+                                processingStartTime = Date.now();
+                                if (data.buffer_duration) {
+                                    metrics.bufferDuration = data.buffer_duration;
+                                }
+                            } else if (data.type === 'transcription_stream') {
+                                // Handle partial transcription updates
+                                if (data.partial_text) {
+                                    updatePartialTranscription(data.partial_text);
+                                }
+                            } else if (data.type === 'sentence_complete') {
+                                // Handle completed sentences
+                                if (data.complete_sentence) {
+                                    completeSentence(data.complete_sentence, data.confidence || 1.0);
+                                }
+                            } else if (data.type === 'transcription') {
+                                if (transcriptionStartTime > 0) {
+                                    metrics.transcriptionTime = (Date.now() - transcriptionStartTime) / 1000;
+                                }
+                                if (data.processing_time) {
+                                    metrics.transcriptionTime = data.processing_time;
+                                }
+                            } else if (data.type === 'intent') {
+                                // LLM classification time is embedded in transcription time for now
+                                metrics.llmTime = metrics.transcriptionTime * 0.1; // Estimate
+                            } else if (data.type === 'claude_execution' && data.status === 'starting') {
+                                // Claude execution starts
+                            } else if (data.type === 'claude_result') {
+                                if (data.execution_time) {
+                                    metrics.claudeTime = data.execution_time;
+                                }
+                                if (processingStartTime > 0) {
+                                    metrics.totalTime = (Date.now() - processingStartTime) / 1000;
+                                }
+                                updatePerformanceMetrics();
+                            }
+                            
+                            // Check if this is a debug message
+                            const isDebug = shouldDisplayDebugMessage(data.type);
+                            addMessage(`JSON: ${JSON.stringify(data, null, 2)}`, 'received', isDebug);
                         } catch (e) {
                             addMessage(`Text: ${event.data}`, 'received');
                         }
@@ -121,16 +405,36 @@
                 };
                 
                 ws.onclose = function(event) {
-                    updateStatus('Disconnected', false);
-                    addMessage(`Connection closed: ${event.code} ${event.reason}`, 'received');
+                    let reason = event.reason || 'No reason provided';
+                    let codeText = '';
+                    if (event.code === 1000) codeText = ' (Normal closure)';
+                    else if (event.code === 1001) codeText = ' (Going away)';
+                    else if (event.code === 1002) codeText = ' (Protocol error)';
+                    else if (event.code === 1003) codeText = ' (Unsupported data)';
+                    else if (event.code === 1006) codeText = ' (Abnormal closure)';
+                    else if (event.code === 1011) codeText = ' (Server error)';
+                    else if (event.code === 1012) codeText = ' (Service restart)';
+                    else if (event.code === 1013) codeText = ' (Try again later)';
+                    else if (event.code === 1014) codeText = ' (Bad gateway)';
+                    else if (event.code === 1015) codeText = ' (TLS handshake failed)';
+                    
+                    addMessage(`Connection closed: ${event.code}${codeText} - ${reason}`, 'received');
+                    
+                    // Attempt reconnection unless it was a normal closure
+                    if (event.code !== 1000) {
+                        attemptReconnection();
+                    } else {
+                        updateStatus('Disconnected', 'disconnected');
+                    }
                 };
                 
                 ws.onerror = function(error) {
-                    updateStatus('Error', false);
-                    addMessage(`Error: ${error}`, 'received');
+                    addMessage(`WebSocket Error: ${error.type || 'Unknown error'} - Check server status`, 'received');
+                    console.error('WebSocket error details:', error);
+                    // Error will trigger onclose, which will handle reconnection
                 };
                 
-                updateStatus('Connecting...', false);
+                updateStatus('Connecting...', 'connecting');
                 
             } catch (error) {
                 addMessage(`Connection error: ${error}`, 'received');
@@ -144,24 +448,6 @@
             }
         }
 
-        function sendMessage() {
-            const message = messageInput.value.trim();
-            if (!message || !connected) return;
-
-            const data = {
-                type: "text_message",
-                content: message,
-                timestamp: Date.now()
-            };
-
-            try {
-                ws.send(JSON.stringify(data));
-                addMessage(`Sent: ${message}`, 'sent');
-                messageInput.value = '';
-            } catch (error) {
-                addMessage(`Send error: ${error}`, 'received');
-            }
-        }
 
         function sendTestAudio() {
             if (!connected) return;
@@ -189,13 +475,6 @@
             messagesDiv.innerHTML = '';
         }
 
-        async function toggleVoiceChat() {
-            if (!voiceChatEnabled) {
-                await startVoiceChat();
-            } else {
-                stopVoiceChat();
-            }
-        }
 
         async function startVoiceChat() {
             try {
@@ -234,7 +513,6 @@
                 processor.connect(audioContext.destination);
                 
                 voiceChatEnabled = true;
-                toggleMicBtn.textContent = '🔴 Disable Voice Chat';
                 voiceStatus.textContent = '🎙️ Voice chat active - speak naturally';
                 addMessage('Voice chat enabled - continuous streaming', 'sent');
                 
@@ -259,27 +537,55 @@
             }
             
             voiceChatEnabled = false;
-            toggleMicBtn.textContent = '🎤 Enable Voice Chat';
             voiceStatus.textContent = '';
             addMessage('Voice chat disabled', 'sent');
         }
 
-        // Event listeners
-        connectBtn.addEventListener('click', connect);
-        disconnectBtn.addEventListener('click', disconnect);
-        sendBtn.addEventListener('click', sendMessage);
+        // Event listeners (connect/disconnect now automatic)
         sendAudioBtn.addEventListener('click', sendTestAudio);
         clearBtn.addEventListener('click', clearMessages);
-        toggleMicBtn.addEventListener('click', toggleVoiceChat);
+        debugToggle.addEventListener('click', toggleDebugMode);
 
-        messageInput.addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                sendMessage();
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'd') {
+                e.preventDefault();
+                toggleDebugMode();
             }
         });
 
-        // Initialize
-        updateStatus('Disconnected', false);
+
+        // Initialize - automatically connect on page load
+        async function initialize() {
+            updateStatus('Requesting microphone access...', 'connecting');
+            
+            // Request microphone permission first
+            try {
+                await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
+                
+                updateStatus('Connecting to voice chat...', 'connecting');
+                // Auto-connect after microphone permission is granted
+                setTimeout(() => {
+                    connect();
+                }, 500);
+                
+            } catch (error) {
+                updateStatus(`Microphone access required for voice chat. Please refresh and allow microphone access.`, 'error');
+                addMessage(`Microphone permission denied: ${error.message}`, 'received');
+                console.error('Microphone permission error:', error);
+            }
+        }
+        
+        // Start initialization when page loads
+        initialize();
     </script>
 </body>
 </html>

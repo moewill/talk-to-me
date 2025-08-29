@@ -378,6 +378,14 @@ class AudioProcessor:
                 rms_level = np.sqrt(np.mean(audio_array**2))
                 if rms_level < 0.001:
                     logger.warning(f"Audio appears to be silent (RMS: {rms_level:.6f})")
+                elif rms_level < 0.01:
+                    logger.warning(f"Audio appears to be very quiet (RMS: {rms_level:.6f}) - consider speaking louder or adjusting microphone")
+                    
+                # Warn about potential sample rate mismatch
+                expected_samples_16k = len(audio_bytes) / 2  # 16-bit = 2 bytes per sample
+                if len(audio_array) != expected_samples_16k:
+                    logger.warning(f"Sample count mismatch - expected {expected_samples_16k}, got {len(audio_array)}")
+                    logger.warning("Browser may be sending different sample rate than 16kHz")
                 
                 return audio_array, duration
             
