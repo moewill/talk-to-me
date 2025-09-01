@@ -64,6 +64,9 @@ class ClaudeInterface:
         self.execution_history: List[ClaudeResponse] = []
         self.max_history = 100  # Keep last 100 executions
         
+        # Concurrency control to prevent race conditions
+        self._execution_lock = asyncio.Lock()
+        
         # Statistics tracking
         self._stats = ClaudeStats(
             total_commands=0,
@@ -93,54 +96,55 @@ class ClaudeInterface:
         Returns:
             ClaudeResponse with execution results
         """
-        start_time = time.time()
-        
-        try:
-            # Check if Claude CLI is available
-            if not await self._check_claude_availability():
-                return ClaudeResponse(
+        async with self._execution_lock:
+            start_time = time.time()
+            
+            try:
+                # Check if Claude CLI is available
+                if not await self._check_claude_availability():
+                    return ClaudeResponse(
+                        success=False,
+                        output="",
+                        error="Claude CLI not found or not accessible",
+                        exit_code=-1,
+                        execution_time=0.0,
+                        timestamp=start_time,
+                        command=command,
+                        raw_output=""
+                    )
+                
+                # Prepare the CLI command
+                cli_command = await self._prepare_command(command, model, additional_args)
+                
+                # Execute the command
+                result = await self._run_command(cli_command, command)
+                
+                # Update statistics
+                self._update_stats(result)
+                
+                # Add to history
+                self._add_to_history(result)
+                
+                return result
+                
+            except Exception as e:
+                execution_time = time.time() - start_time
+                error_result = ClaudeResponse(
                     success=False,
                     output="",
-                    error="Claude CLI not found or not accessible",
+                    error=f"Execution error: {str(e)}",
                     exit_code=-1,
-                    execution_time=0.0,
+                    execution_time=execution_time,
                     timestamp=start_time,
                     command=command,
                     raw_output=""
                 )
-            
-            # Prepare the CLI command
-            cli_command = await self._prepare_command(command, model, additional_args)
-            
-            # Execute the command
-            result = await self._run_command(cli_command, command)
-            
-            # Update statistics
-            self._update_stats(result)
-            
-            # Add to history
-            self._add_to_history(result)
-            
-            return result
-            
-        except Exception as e:
-            execution_time = time.time() - start_time
-            error_result = ClaudeResponse(
-                success=False,
-                output="",
-                error=f"Execution error: {str(e)}",
-                exit_code=-1,
-                execution_time=execution_time,
-                timestamp=start_time,
-                command=command,
-                raw_output=""
-            )
-            
-            self._update_stats(error_result)
-            self._add_to_history(error_result)
-            
-            logger.error(f"Claude execution error: {e}")
-            return error_result
+                
+                self._update_stats(error_result)
+                self._add_to_history(error_result)
+                
+                logger.error(f"Claude execution error: {e}")
+                return error_result
 
     async def _check_claude_availability(self) -> bool:
         """Check if Claude CLI is available and accessible."""

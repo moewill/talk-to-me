@@ -81,6 +81,15 @@ class SentenceDetector:
         
         cleaned_text = text.strip()
         
+        # Handle very short inputs that are unlikely to be complete sentences
+        if len(cleaned_text) < 3:
+            return SentenceBoundaryResult(
+                completed_sentences=[],
+                remaining_fragment=cleaned_text,
+                confidence=0.1,  # Very low confidence for short fragments
+                is_complete=False
+            )
+        
         try:
             # Use Claude CLI for intelligent sentence boundary detection
             if self.claude_available:
@@ -136,6 +145,7 @@ Where:
 - is_complete: Whether the entire text represents complete thought(s)
 """
 
+        result = None
         try:
             result = subprocess.run(
                 [self.claude_binary, "--print"],
@@ -181,7 +191,8 @@ Where:
             
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Claude response as JSON: {e}")
-            logger.error(f"Raw response: {result.stdout}")
+            if result:
+                logger.error(f"Raw response: {result.stdout}")
             return self._detect_with_fallback(text)
         except Exception as e:
             logger.error(f"Claude sentence detection failed: {e}")

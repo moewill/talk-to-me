@@ -62,7 +62,7 @@
     <div class="container">
         <h1>WebSocket Test Client</h1>
         
-        <div>
+        <div style="display: none;">
             <input type="text" id="url" value="ws://localhost:8080" placeholder="WebSocket URL">
             <button id="connect">Connect</button>
             <button id="disconnect" disabled>Disconnect</button>
@@ -72,9 +72,6 @@
         
         <div class="messages" id="messages"></div>
         
-        <div>
-            <button id="sendAudio" disabled>Send Test Audio</button>
-        </div>
         
         <div>
             <span id="voiceStatus"></span>
@@ -115,7 +112,6 @@
         const disconnectBtn = document.getElementById('disconnect');
         const statusDiv = document.getElementById('status');
         const messagesDiv = document.getElementById('messages');
-        const sendAudioBtn = document.getElementById('sendAudio');
         const clearBtn = document.getElementById('clear');
         const voiceStatus = document.getElementById('voiceStatus');
         const debugToggle = document.getElementById('debugToggle');
@@ -137,6 +133,18 @@
         let retryCount = 0;
         let maxRetries = 5;
         let retryTimeout = null;
+        
+        // Centralized timeout management
+        function clearAllTimeouts() {
+            if (errorTimeout) {
+                clearTimeout(errorTimeout);
+                errorTimeout = null;
+            }
+            if (retryTimeout) {
+                clearTimeout(retryTimeout);
+                retryTimeout = null;
+            }
+        }
         
         // Debug system
         let debugMode = false;
@@ -241,10 +249,9 @@
             statusDiv.className = `status ${state}`;
             connected = (state === 'connected');
             
-            // Update button states (keeping existing logic for remaining buttons)
-            connectBtn.disabled = connected;
-            disconnectBtn.disabled = !connected;
-            sendAudioBtn.disabled = !connected;
+            // Update button states only if elements exist (avoiding null reference errors)
+            if (connectBtn) connectBtn.disabled = connected;
+            if (disconnectBtn) disconnectBtn.disabled = !connected;
         }
 
         function showTemporaryError(errorMessage, duration = 3000) {
@@ -260,6 +267,7 @@
         function attemptReconnection() {
             if (retryCount >= maxRetries) {
                 updateStatus('Connection failed after multiple attempts. Please refresh the page.', 'error');
+                retryCount = 0; // Reset for future attempts
                 return;
             }
             
@@ -268,8 +276,15 @@
             
             updateStatus(`Reconnecting in ${Math.ceil(delay / 1000)}s... (attempt ${retryCount}/${maxRetries})`, 'connecting');
             
+            // Clear any existing retry timeout to prevent overlap
+            if (retryTimeout) {
+                clearTimeout(retryTimeout);
+                retryTimeout = null;
+            }
+            
             retryTimeout = setTimeout(() => {
                 updateStatus('Attempting to reconnect...', 'connecting');
+                retryTimeout = null; // Clear timeout reference
                 connect();
             }, delay);
         }
@@ -300,12 +315,12 @@
         }
         
         function updatePerformanceMetrics() {
-            document.getElementById('modelInfo').textContent = metrics.modelName;
-            document.getElementById('bufferInfo').textContent = `${metrics.bufferDuration}s`;
-            document.getElementById('transcriptionTime').textContent = `${metrics.transcriptionTime.toFixed(2)}s`;
-            document.getElementById('llmTime').textContent = `${metrics.llmTime.toFixed(2)}s`;
-            document.getElementById('claudeTime').textContent = `${metrics.claudeTime.toFixed(2)}s`;
-            document.getElementById('totalTime').textContent = `${metrics.totalTime.toFixed(2)}s`;
+            document.getElementById('modelInfo').textContent = metrics.modelName || 'unknown';
+            document.getElementById('bufferInfo').textContent = `${(metrics.bufferDuration || 0).toFixed(2)}s`;
+            document.getElementById('transcriptionTime').textContent = `${(metrics.transcriptionTime || 0).toFixed(2)}s`;
+            document.getElementById('llmTime').textContent = `${(metrics.llmTime || 0).toFixed(2)}s`;
+            document.getElementById('claudeTime').textContent = `${(metrics.claudeTime || 0).toFixed(2)}s`;
+            document.getElementById('totalTime').textContent = `${(metrics.totalTime || 0).toFixed(2)}s`;
             
             // Calculate connection quality based on processing times
             let quality = 'Good';
@@ -420,6 +435,11 @@
                     
                     addMessage(`Connection closed: ${event.code}${codeText} - ${reason}`, 'received');
                     
+                    // Clean up voice chat on connection issues
+                    if (voiceChatEnabled) {
+                        stopVoiceChat();
+                    }
+                    
                     // Attempt reconnection unless it was a normal closure
                     if (event.code !== 1000) {
                         attemptReconnection();
@@ -442,34 +462,18 @@
         }
 
         function disconnect() {
+            clearAllTimeouts();
+            retryCount = 0;  // Reset retry counter on manual disconnect
+            
             if (ws) {
                 ws.close();
                 ws = null;
             }
-        }
-
-
-        function sendTestAudio() {
-            if (!connected) return;
-
-            // Generate test audio data (sine wave)
-            const sampleRate = 16000;
-            const duration = 2;
-            const frequency = 440;
-            const samples = sampleRate * duration;
             
-            const audioData = new Int16Array(samples);
-            for (let i = 0; i < samples; i++) {
-                audioData[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate) * 32767;
-            }
-
-            try {
-                ws.send(audioData.buffer);
-                addMessage(`Sent test audio: ${audioData.buffer.byteLength} bytes`, 'sent');
-            } catch (error) {
-                addMessage(`Audio send error: ${error}`, 'received');
-            }
+            stopVoiceChat();
         }
+
+
 
         function clearMessages() {
             messagesDiv.innerHTML = '';
@@ -542,7 +546,6 @@
         }
 
         // Event listeners (connect/disconnect now automatic)
-        sendAudioBtn.addEventListener('click', sendTestAudio);
         clearBtn.addEventListener('click', clearMessages);
         debugToggle.addEventListener('click', toggleDebugMode);
 
@@ -578,8 +581,22 @@
                 }, 500);
                 
             } catch (error) {
-                updateStatus(`Microphone access required for voice chat. Please refresh and allow microphone access.`, 'error');
-                addMessage(`Microphone permission denied: ${error.message}`, 'received');
+                let errorMessage = 'Microphone access required for voice chat.';
+                let statusMessage = 'Microphone access denied';
+                
+                if (error.name === 'NotAllowedError') {
+                    errorMessage = 'Microphone permission denied. Please allow microphone access and refresh the page.';
+                    statusMessage = 'Permission denied - refresh page and allow microphone';
+                } else if (error.name === 'NotFoundError') {
+                    errorMessage = 'No microphone found. Please connect a microphone and refresh the page.';  
+                    statusMessage = 'No microphone detected';
+                } else if (error.name === 'NotReadableError') {
+                    errorMessage = 'Microphone is already in use by another application.';
+                    statusMessage = 'Microphone in use by another app';
+                }
+                
+                updateStatus(statusMessage, 'error');
+                addMessage(errorMessage, 'received');
                 console.error('Microphone permission error:', error);
             }
         }

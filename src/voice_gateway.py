@@ -203,9 +203,8 @@ class VoiceGateway:
             processed_messages=0,
             audio_buffer=b"",
             last_audio_time=0.0,
-            buffer_start_time=None,
-            partial_transcription="",
-            partial_transcription_start=None
+            buffer_start_time=None
+            # partial_transcription and partial_transcription_start use defaults
         )
         
         self.active_connections[connection_id] = connection_info
@@ -252,9 +251,18 @@ class VoiceGateway:
         finally:
             # Clean up connection
             if connection_id in self.active_connections:
+                connection_info = self.active_connections[connection_id]
+                # Clear audio buffer to prevent memory leaks
+                if hasattr(connection_info, 'audio_buffer'):
+                    connection_info.audio_buffer = b""
+                # Clear partial transcription state  
+                if hasattr(connection_info, 'partial_transcription'):
+                    connection_info.partial_transcription = ""
+                    connection_info.partial_transcription_start = None
+                
                 del self.active_connections[connection_id]
                 self.stats.active_connections = len(self.active_connections)
-                logger.info(f"Connection {connection_id} removed")
+                logger.info(f"Connection {connection_id} removed and cleaned up")
 
     async def _process_messages(self, connection_info: ConnectionInfo) -> None:
         """
@@ -452,8 +460,25 @@ class VoiceGateway:
             
             # Detect sentence boundaries in the accumulated text
             logger.debug(f"[{connection_info.connection_id}] Accumulated text for sentence detection: '{accumulated_text}'")
-            boundary_result = self.sentence_detector.detect_sentence_boundary(accumulated_text)
-            logger.debug(f"[{connection_info.connection_id}] Sentence boundary result: {len(boundary_result.completed_sentences)} complete, fragment: '{boundary_result.remaining_fragment}', confidence: {boundary_result.confidence}")
+            try:
+                boundary_result = self.sentence_detector.detect_sentence_boundary(accumulated_text)
+                logger.debug(f"[{connection_info.connection_id}] Sentence boundary result: {len(boundary_result.completed_sentences)} complete, fragment: '{boundary_result.remaining_fragment}', confidence: {boundary_result.confidence}")
+            except Exception as e:
+                logger.error(f"[{connection_info.connection_id}] Sentence detector failed: {e}")
+                # Fall back to treating the entire text as a complete sentence
+                await self._send_message(websocket, {
+                    "type": "sentence_complete", 
+                    "complete_sentence": accumulated_text,
+                    "confidence": 0.3,  # Low confidence for fallback
+                    "processing_time": transcription_result.processing_time,
+                    "fallback_used": True
+                })
+                # Process the fallback sentence for Claude commands
+                await self._process_text_command(connection_info, accumulated_text)
+                # Clear partial transcription state
+                connection_info.partial_transcription = ""
+                connection_info.partial_transcription_start = None
+                return
             
             # Send completed sentences as finalized transcriptions
             for completed_sentence in boundary_result.completed_sentences:
@@ -506,6 +531,9 @@ class VoiceGateway:
                     
                     # Update the stored partial transcription
                     connection_info.partial_transcription = boundary_result.remaining_fragment
+                    # Maintain the start time if it was already set, otherwise set it now
+                    if connection_info.partial_transcription_start is None:
+                        connection_info.partial_transcription_start = current_time
             else:
                 # No remaining fragment - clear partial transcription
                 connection_info.partial_transcription = ""
