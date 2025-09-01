@@ -120,6 +120,7 @@ class AudioProcessor:
         """Check if required dependencies are available."""
         if not WHISPER_AVAILABLE:
             logger.error("OpenAI Whisper is required but not installed")
+            raise ImportError("OpenAI Whisper is required for audio processing. Install with: pip install openai-whisper")
             
         if not SOUNDFILE_AVAILABLE:
             logger.warning("soundfile not available - some audio formats may not work")

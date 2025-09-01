@@ -209,12 +209,19 @@ class ClaudeInterface:
             loop = asyncio.get_event_loop()
             
             def run_claude_sync():
-                return subprocess.run(
-                    cli_command,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout
-                )
+                try:
+                    return subprocess.run(
+                        cli_command,
+                        capture_output=True,
+                        text=True,
+                        timeout=self.timeout
+                    )
+                except subprocess.TimeoutExpired as e:
+                    # Re-raise timeout to be handled by outer try/catch
+                    raise e
+                except Exception as e:
+                    # Wrap other subprocess errors
+                    raise RuntimeError(f"Subprocess execution failed: {e}")
             
             # Run in thread to avoid blocking
             result = await loop.run_in_executor(None, run_claude_sync)

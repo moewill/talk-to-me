@@ -158,37 +158,48 @@ Where:
             if result.returncode != 0:
                 logger.error(f"Claude CLI error: {result.stderr}")
                 return self._detect_with_fallback(text)
+                
+        except subprocess.TimeoutExpired:
+            logger.error("Claude CLI timeout during sentence detection")
+            return self._detect_with_fallback(text)
+        except Exception as e:
+            logger.error(f"Claude CLI execution error: {e}")
+            if result:
+                logger.error(f"Raw response: {result.stdout}")
+            return self._detect_with_fallback(text)
             
-            # Parse JSON response (handle markdown code blocks)
-            raw_output = result.stdout.strip()
+        # Parse JSON response (handle markdown code blocks)
+        raw_output = result.stdout.strip()
             
-            # Extract JSON from markdown code blocks if present
-            if raw_output.startswith('```json'):
-                json_start = raw_output.find('```json') + 7
-                json_end = raw_output.find('```', json_start)
-                if json_end != -1:
-                    json_content = raw_output[json_start:json_end].strip()
-                else:
-                    json_content = raw_output[json_start:].strip()
-            elif raw_output.startswith('```'):
-                json_start = raw_output.find('```') + 3
-                json_end = raw_output.find('```', json_start)
-                if json_end != -1:
-                    json_content = raw_output[json_start:json_end].strip()
-                else:
-                    json_content = raw_output[json_start:].strip()
+        # Extract JSON from markdown code blocks - handle multiple code blocks
+        json_content = raw_output
+        if '```json' in raw_output:
+            # Find the first JSON code block
+            json_start = raw_output.find('```json') + 7
+            json_end = raw_output.find('```', json_start)
+            if json_end != -1:
+                json_content = raw_output[json_start:json_end].strip()
             else:
-                json_content = raw_output
+                # No closing ``` found, take everything after ```json
+                json_content = raw_output[json_start:].strip()
+        elif raw_output.count('```') >= 2:
+            # Find first complete code block (not necessarily JSON)
+            json_start = raw_output.find('```') + 3
+            json_end = raw_output.find('```', json_start)
+            if json_end != -1:
+                json_content = raw_output[json_start:json_end].strip()
+        # If no code blocks or incomplete blocks, use raw output
             
+        try:
             response = json.loads(json_content)
-            
+                
             return SentenceBoundaryResult(
                 completed_sentences=response.get('completed_sentences', []),
                 remaining_fragment=response.get('remaining_fragment', ''),
                 confidence=float(response.get('confidence', 0.0)),
                 is_complete=response.get('is_complete', False)
             )
-            
+                
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Claude response as JSON: {e}")
             if result:

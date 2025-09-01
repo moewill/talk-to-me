@@ -46,11 +46,8 @@ class IntentClassifier:
             'average_response_time': 0.0
         }
         
-        # Test Claude availability
-        self.claude_available = self._test_claude_availability()
-        
-        if not self.claude_available:
-            logger.warning("Claude CLI not available - will use fallback classification")
+        # Test Claude availability asynchronously later
+        self.claude_available = None  # Will be set by async test
     
     def _test_claude_availability(self) -> bool:
         """Test if Claude CLI is available."""
@@ -64,8 +61,22 @@ class IntentClassifier:
             return result.returncode == 0
         except Exception:
             return False
+    
+    async def _test_claude_availability_async(self) -> bool:
+        """Test if Claude CLI is available asynchronously."""
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: subprocess.run(
+                [self.claude_binary, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            ))
+            return result.returncode == 0
+        except Exception:
+            return False
 
-    def detect_intent(self, text: str) -> IntentResult:
+    async def detect_intent(self, text: str) -> IntentResult:
         """
         Detect if the given text contains a Claude command using LLM reasoning.
         
@@ -98,6 +109,10 @@ class IntentClassifier:
                 original_text=text,
                 detected_keywords=[]
             )
+        
+        # Test Claude availability if not yet checked
+        if self.claude_available is None:
+            self.claude_available = await self._test_claude_availability_async()
         
         try:
             # Use LLM to classify intent

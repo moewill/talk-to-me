@@ -176,27 +176,36 @@
         let currentPartialMessage = null;
 
         function updatePartialTranscription(partial_text) {
+            // Sanitize input to prevent XSS
+            const sanitizedText = partial_text.replace(/[<>&"']/g, function(match) {
+                const escapeMap = {'<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#x27;'};
+                return escapeMap[match];
+            });
+            
             if (currentPartialMessage) {
                 // Update existing partial message
                 const timeElement = currentPartialMessage.querySelector('strong');
                 const timestamp = timeElement ? timeElement.textContent : `[${new Date().toLocaleTimeString()}]`;
-                currentPartialMessage.innerHTML = `${timestamp} ${partial_text}<span class="typing-indicator">...</span>`;
+                currentPartialMessage.innerHTML = `${timestamp} ${sanitizedText}<span class="typing-indicator">...</span>`;
             } else {
                 // Create new partial message
                 currentPartialMessage = document.createElement('div');
                 currentPartialMessage.className = 'message sent partial';
-                currentPartialMessage.innerHTML = `<strong>[${new Date().toLocaleTimeString()}]</strong> ${partial_text}<span class="typing-indicator">...</span>`;
+                currentPartialMessage.innerHTML = `<strong>[${new Date().toLocaleTimeString()}]</strong> ${sanitizedText}<span class="typing-indicator">...</span>`;
                 messagesDiv.appendChild(currentPartialMessage);
                 
                 // Limit message history for performance (keep last 100 messages)
                 const messages = messagesDiv.querySelectorAll('.message');
                 if (messages.length > 100) {
-                    // Remove oldest messages, but preserve current partial message
+                    // Build list of messages to remove, excluding current partial message
+                    const messagesToRemove = [];
                     for (let i = 0; i < messages.length - 100; i++) {
                         if (messages[i] !== currentPartialMessage) {
-                            messages[i].remove();
+                            messagesToRemove.push(messages[i]);
                         }
                     }
+                    // Remove messages safely
+                    messagesToRemove.forEach(msg => msg.remove());
                 }
                 
                 messagesDiv.scrollTop = messagesDiv.scrollHeight;
@@ -337,6 +346,12 @@
                 return;
             }
 
+            // Close existing connection if any
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+                ws = null;
+            }
+
             try {
                 ws = new WebSocket(url);
                 
@@ -387,15 +402,19 @@
                                     completeSentence(data.complete_sentence, data.confidence || 1.0);
                                 }
                             } else if (data.type === 'transcription') {
-                                if (transcriptionStartTime > 0) {
-                                    metrics.transcriptionTime = (Date.now() - transcriptionStartTime) / 1000;
-                                }
+                                // Use server-provided processing time if available, otherwise calculate client-side
                                 if (data.processing_time) {
                                     metrics.transcriptionTime = data.processing_time;
+                                } else if (transcriptionStartTime > 0) {
+                                    metrics.transcriptionTime = (Date.now() - transcriptionStartTime) / 1000;
                                 }
                             } else if (data.type === 'intent') {
-                                // LLM classification time is embedded in transcription time for now
-                                metrics.llmTime = metrics.transcriptionTime * 0.1; // Estimate
+                                // Use actual LLM time if provided, otherwise estimate
+                                if (data.processing_time) {
+                                    metrics.llmTime = data.processing_time;
+                                } else {
+                                    metrics.llmTime = metrics.transcriptionTime * 0.1; // Fallback estimate
+                                }
                             } else if (data.type === 'claude_execution' && data.status === 'starting') {
                                 // Claude execution starts
                             } else if (data.type === 'claude_result') {
@@ -495,26 +514,55 @@
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
                 microphone = audioContext.createMediaStreamSource(stream);
                 
-                // Create a script processor for real-time audio processing
-                processor = audioContext.createScriptProcessor(4096, 1, 1);
-                
-                processor.onaudioprocess = function(event) {
-                    if (!connected || !ws) return;
+                // Use MediaRecorder as fallback since AudioWorklet requires HTTPS
+                if (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm')) {
+                    // Use MediaRecorder for better browser compatibility
+                    const mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm',
+                        bitsPerSecond: 256000
+                    });
                     
-                    const inputData = event.inputBuffer.getChannelData(0);
+                    mediaRecorder.ondataavailable = function(event) {
+                        if (!connected || !ws || event.data.size === 0) return;
+                        
+                        try {
+                            // Send WebM data (server will need to handle format conversion)
+                            ws.send(event.data);
+                        } catch (error) {
+                            console.error('Failed to send audio data:', error);
+                            addMessage(`Audio send error: ${error.message}`, 'received');
+                        }
+                    };
                     
-                    // Convert float32 to int16 PCM
-                    const pcmData = new Int16Array(inputData.length);
-                    for (let i = 0; i < inputData.length; i++) {
-                        pcmData[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
-                    }
+                    mediaRecorder.start(100); // Capture in 100ms chunks
+                    processor = mediaRecorder; // Store for cleanup
+                } else {
+                    // Fallback to ScriptProcessor (deprecated but works)
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
                     
-                    // Send raw PCM data
-                    ws.send(pcmData.buffer);
-                };
-                
-                microphone.connect(processor);
-                processor.connect(audioContext.destination);
+                    processor.onaudioprocess = function(event) {
+                        if (!connected || !ws) return;
+                        
+                        const inputData = event.inputBuffer.getChannelData(0);
+                        
+                        // Convert float32 to int16 PCM
+                        const pcmData = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            pcmData[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                        }
+                        
+                        try {
+                            // Send raw PCM data with error handling
+                            ws.send(pcmData.buffer);
+                        } catch (error) {
+                            console.error('Failed to send audio data:', error);
+                            addMessage(`Audio send error: ${error.message}`, 'received');
+                        }
+                    };
+                    
+                    microphone.connect(processor);
+                    // Don't connect to destination to avoid feedback loops
+                }
                 
                 voiceChatEnabled = true;
                 voiceStatus.textContent = '🎙️ Voice chat active - speak naturally';
@@ -528,7 +576,12 @@
 
         function stopVoiceChat() {
             if (processor) {
-                processor.disconnect();
+                // Handle both MediaRecorder and ScriptProcessor
+                if (processor.stop && typeof processor.stop === 'function') {
+                    processor.stop(); // MediaRecorder
+                } else if (processor.disconnect && typeof processor.disconnect === 'function') {
+                    processor.disconnect(); // ScriptProcessor
+                }
                 processor = null;
             }
             if (microphone) {
@@ -576,9 +629,11 @@
                 
                 updateStatus('Connecting to voice chat...', 'connecting');
                 // Auto-connect after microphone permission is granted
+                // Use shorter delay or immediate connection based on readiness
+                const connectDelay = audioContext && audioContext.state === 'running' ? 100 : 500;
                 setTimeout(() => {
                     connect();
-                }, 500);
+                }, connectDelay);
                 
             } catch (error) {
                 let errorMessage = 'Microphone access required for voice chat.';

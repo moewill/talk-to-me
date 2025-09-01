@@ -91,6 +91,7 @@ class VoiceGateway:
         # Connection management
         self.active_connections: Dict[str, ConnectionInfo] = {}
         self.connection_counter = 0
+        self._connection_lock = asyncio.Lock()
         
         # Statistics tracking
         self.stats = ProcessingStats(
@@ -112,6 +113,7 @@ class VoiceGateway:
         self.audio_buffer_duration = 3.0  # seconds - buffer audio for optimal balance (accuracy vs responsiveness)
         self.audio_silence_timeout = 0.8  # seconds - process buffer if no audio for 800ms 
         self.min_buffer_duration = 0.8   # seconds - minimum audio length to process
+        self.sample_rate = 16000  # Expected audio sample rate
         
         # Sentence completion timeout
         self.sentence_timeout = 5.0  # seconds - force sentence completion after 5 seconds of partial text
@@ -185,29 +187,30 @@ class VoiceGateway:
         Args:
             websocket: The WebSocket connection
         """
-        connection_id = f"conn_{self.connection_counter}"
-        self.connection_counter += 1
-        
-        # Check connection limits
-        if len(self.active_connections) >= self.max_connections:
-            logger.warning(f"Connection limit reached, rejecting {connection_id}")
-            await websocket.close(code=1013, reason="Server overloaded")
-            return
-        
-        # Create connection info
-        connection_info = ConnectionInfo(
-            websocket=websocket,
-            connection_id=connection_id,
-            connected_at=time.time(),
-            last_activity=time.time(),
-            processed_messages=0,
-            audio_buffer=b"",
-            last_audio_time=0.0,
-            buffer_start_time=None
-            # partial_transcription and partial_transcription_start use defaults
-        )
-        
-        self.active_connections[connection_id] = connection_info
+        async with self._connection_lock:
+            connection_id = f"conn_{self.connection_counter}"
+            self.connection_counter += 1
+            
+            # Check connection limits with proper locking
+            if len(self.active_connections) >= self.max_connections:
+                logger.warning(f"Connection limit reached, rejecting {connection_id}")
+                await websocket.close(code=1013, reason="Server overloaded")
+                return
+            
+            # Create connection info
+            connection_info = ConnectionInfo(
+                websocket=websocket,
+                connection_id=connection_id,
+                connected_at=time.time(),
+                last_activity=time.time(),
+                processed_messages=0,
+                audio_buffer=b"",
+                last_audio_time=0.0,
+                buffer_start_time=None
+                # partial_transcription and partial_transcription_start use defaults
+            )
+            
+            self.active_connections[connection_id] = connection_info
         self.stats.total_connections += 1
         self.stats.active_connections = len(self.active_connections)
         
@@ -364,7 +367,9 @@ class VoiceGateway:
             
             # Add audio data to buffer
             connection_info.audio_buffer += audio_data
-            buffer_duration = len(connection_info.audio_buffer) / (16000 * 2)  # 16kHz, 16-bit
+            # Calculate buffer duration based on actual audio format
+            bytes_per_sample = 2  # 16-bit = 2 bytes per sample
+            buffer_duration = len(connection_info.audio_buffer) / (self.sample_rate * bytes_per_sample)
             
             logger.debug(f"[{connection_info.connection_id}] Buffered audio: {len(audio_data)} bytes, "
                         f"total buffer: {len(connection_info.audio_buffer)} bytes ({buffer_duration:.2f}s)")
@@ -575,7 +580,7 @@ class VoiceGateway:
         try:
             logger.debug(f"Processing text command: '{text}'")
             # Classify intent
-            intent_result = self.intent_classifier.detect_intent(text)
+            intent_result = await self.intent_classifier.detect_intent(text)
             logger.debug(f"Intent classification result: {intent_result}")
             
             # Send intent classification result
@@ -781,13 +786,13 @@ class VoiceGateway:
                 current_time = time.time()
                 connections_to_process = []
                 
-                # Check all connections for silence timeout
-                for connection_id, connection_info in self.active_connections.items():
+                # Check all connections for silence timeout (use list() to avoid iteration issues)
+                for connection_id, connection_info in list(self.active_connections.items()):
                     if (connection_info.audio_buffer and 
                         connection_info.last_audio_time > 0 and
                         current_time - connection_info.last_audio_time >= self.audio_silence_timeout):
                         
-                        buffer_duration = len(connection_info.audio_buffer) / (16000 * 2)
+                        buffer_duration = len(connection_info.audio_buffer) / (self.sample_rate * 2)
                         if buffer_duration >= self.min_buffer_duration:
                             connections_to_process.append((connection_info, buffer_duration))
                 
