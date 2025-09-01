@@ -184,8 +184,8 @@ class ClaudeInterface:
         additional_args: Optional[List[str]]
     ) -> List[str]:
         """Prepare the CLI command arguments."""
-        # Base command
-        cli_args = [self.claude_binary]
+        # Base command with print flag for non-interactive execution
+        cli_args = [self.claude_binary, '--print']
         
         # Add model if specified (otherwise use default)
         if model:
