@@ -86,7 +86,7 @@ class VoiceGateway:
         self.audio_processor = AudioProcessor(model_name=whisper_model)
         self.intent_classifier = IntentClassifier()
         self.claude_interface = ClaudeInterface(claude_binary=claude_binary)
-        self.sentence_detector = SentenceDetector(claude_binary=claude_binary)
+        self.sentence_detector = SentenceDetector()
         
         # Connection management
         self.active_connections: Dict[str, ConnectionInfo] = {}
